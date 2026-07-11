@@ -1,0 +1,1535 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ピコラボ ― mp3を8bitサウンドに変換して遊ぶラボ</title>
+<style>
+/* ===== テーマ ===== */
+:root {
+  --bg: #0d0f1a;
+  --panel: #151a2c;
+  --panel2: #1c2238;
+  --border: #2c3555;
+  --text: #d8e0f4;
+  --dim: #8791b3;
+  --accent: #6ee787;
+  --accent2: #ffb454;
+  --danger: #ff6b81;
+  --shadow: #05060c;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Segoe UI", "Hiragino Sans", "Yu Gothic UI", sans-serif;
+  font-size: 15px;
+  line-height: 1.6;
+  background-image:
+    repeating-linear-gradient(0deg, rgba(255,255,255,0.015) 0px, rgba(255,255,255,0.015) 1px, transparent 1px, transparent 3px);
+  min-height: 100vh;
+}
+main { max-width: 880px; margin: 0 auto; padding: 16px 16px 64px; }
+
+/* ===== ヘッダー ===== */
+header { text-align: center; padding: 32px 16px 8px; }
+h1 {
+  font-family: "Courier New", monospace;
+  font-size: 34px;
+  letter-spacing: 6px;
+  margin: 0;
+  color: var(--accent);
+  text-shadow: 0 0 12px rgba(110,231,135,0.45), 3px 3px 0 var(--shadow);
+}
+.tagline { color: var(--dim); margin: 8px 0 0; }
+.privacy-badge {
+  display: inline-block;
+  margin-top: 16px;
+  padding: 4px 12px;
+  border: 1px solid var(--accent);
+  border-radius: 2px;
+  color: var(--accent);
+  font-size: 13px;
+  background: rgba(110,231,135,0.06);
+}
+
+/* ===== 共通部品 ===== */
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 16px;
+  margin-top: 16px;
+}
+button {
+  font-family: inherit;
+  font-size: 14px;
+  color: var(--text);
+  background: var(--panel2);
+  border: 2px solid var(--border);
+  border-radius: 2px;
+  padding: 8px 16px;
+  cursor: pointer;
+  box-shadow: 3px 3px 0 var(--shadow);
+  transition: transform 150ms ease, box-shadow 150ms ease, border-color 150ms ease;
+}
+button:hover { border-color: var(--accent); }
+button:active { transform: translate(2px, 2px); box-shadow: 1px 1px 0 var(--shadow); }
+button:focus-visible { outline: 2px solid var(--accent2); outline-offset: 2px; }
+button:disabled { opacity: 0.45; cursor: default; }
+button.primary { border-color: var(--accent); color: var(--accent); }
+button.small { padding: 4px 8px; font-size: 12px; box-shadow: 2px 2px 0 var(--shadow); }
+.hidden { display: none !important; }
+.note { color: var(--dim); font-size: 13px; }
+.error-msg { color: var(--danger); font-size: 13px; min-height: 1.4em; margin: 8px 0 0; }
+kbd {
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 3px;
+  padding: 0 5px;
+  font-size: 12px;
+  font-family: "Courier New", monospace;
+}
+
+/* ===== ドロップゾーン ===== */
+#dropzone {
+  border: 2px dashed var(--border);
+  border-radius: 4px;
+  padding: 48px 24px;
+  text-align: center;
+  margin-top: 24px;
+  transition: border-color 150ms ease, background 150ms ease;
+}
+#dropzone.dragover { border-color: var(--accent); background: rgba(110,231,135,0.05); }
+#dropzone .big { font-size: 17px; margin: 0 0 16px; }
+#dropzone .buttons { display: flex; gap: 16px; justify-content: center; flex-wrap: wrap; margin-top: 8px; }
+
+/* ===== エディタ ===== */
+.file-bar { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+.file-bar .fname { color: var(--accent2); word-break: break-all; }
+.wave-wrap { position: relative; margin-top: 16px; }
+#wave { width: 100%; height: 96px; display: block; background: #0a0c14; border: 1px solid var(--border); border-radius: 2px; cursor: crosshair; }
+.transport { display: flex; align-items: center; gap: 16px; margin-top: 8px; flex-wrap: wrap; }
+#time-display { font-family: "Courier New", monospace; color: var(--dim); font-size: 14px; }
+
+/* タブ */
+.tabs { display: flex; gap: 8px; margin-top: 24px; }
+.tabs button {
+  border-bottom: none;
+  border-radius: 2px 2px 0 0;
+  box-shadow: none;
+  color: var(--dim);
+}
+.tabs button.active { color: var(--accent); border-color: var(--accent); background: var(--panel); }
+.tab-body { border: 2px solid var(--border); border-radius: 0 4px 4px 4px; padding: 16px; background: var(--panel); }
+.tabs button.active + .tab-body { border-color: var(--accent); }
+
+/* パラメータ */
+.presets { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+.presets button.active-preset { border-color: var(--accent2); color: var(--accent2); }
+.param-row { display: grid; grid-template-columns: 160px 1fr 72px; gap: 8px; align-items: center; margin-top: 8px; }
+.param-row label { font-size: 14px; }
+.param-row output { font-family: "Courier New", monospace; font-size: 13px; color: var(--accent); text-align: right; }
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 6px;
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  cursor: pointer;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px; height: 16px;
+  background: var(--accent);
+  border: 2px solid var(--bg);
+  border-radius: 2px;
+  box-shadow: 2px 2px 0 var(--shadow);
+}
+input[type="checkbox"] { accent-color: var(--accent); width: 16px; height: 16px; }
+select {
+  font-family: inherit;
+  background: var(--panel2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  padding: 4px 8px;
+}
+.row-actions { display: flex; gap: 8px; align-items: center; margin-top: 16px; flex-wrap: wrap; }
+
+/* モードB */
+#pianoroll { width: 100%; height: 160px; display: block; background: #0a0c14; border: 1px solid var(--border); border-radius: 2px; margin-top: 8px; }
+.progress-wrap { height: 8px; background: var(--panel2); border: 1px solid var(--border); border-radius: 2px; margin-top: 8px; overflow: hidden; }
+#analyze-progress { height: 100%; width: 0%; background: var(--accent); transition: width 150ms ease; }
+
+/* ===== ダイアログ ===== */
+dialog {
+  background: var(--panel);
+  color: var(--text);
+  border: 2px solid var(--accent);
+  border-radius: 4px;
+  padding: 24px;
+  max-width: 440px;
+  width: calc(100vw - 48px);
+  box-shadow: 8px 8px 0 var(--shadow);
+}
+dialog::backdrop { background: rgba(5,6,12,0.7); }
+dialog h2 { margin: 0 0 16px; font-size: 18px; color: var(--accent); }
+dialog .opt-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.copyright-note {
+  border: 1px solid var(--accent2);
+  border-radius: 2px;
+  background: rgba(255,180,84,0.07);
+  color: var(--accent2);
+  font-size: 13px;
+  padding: 8px 12px;
+  margin-top: 16px;
+}
+dialog .dialog-actions { display: flex; gap: 16px; justify-content: flex-end; margin-top: 24px; }
+
+footer { text-align: center; color: var(--dim); font-size: 12px; padding: 24px 16px; }
+footer a { color: var(--dim); }
+
+@media (max-width: 480px) {
+  h1 { font-size: 26px; letter-spacing: 4px; }
+  .param-row { grid-template-columns: 1fr 64px; }
+  .param-row label { grid-column: 1 / -1; margin-bottom: -4px; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>ピコラボ</h1>
+  <p class="tagline">手持ちの音源を、ブラウザの中だけで8bitサウンドに。</p>
+  <span class="privacy-badge">🔒 すべてブラウザ内で処理 ― アップロードは一切ありません</span>
+</header>
+
+<main>
+  <!-- ===== 画面1: ドロップゾーン ===== -->
+  <section id="screen-drop">
+    <div id="dropzone">
+      <p class="big">音声ファイルをここにドラッグ＆ドロップ</p>
+      <p class="note">対応: mp3 / wav / m4a / ogg（10分以内・ローカルファイルのみ）</p>
+      <div class="buttons">
+        <button id="btn-file" class="primary">ファイルを選ぶ</button>
+        <button id="btn-demo">デモ音源で遊ぶ（自作曲をその場で生成）</button>
+      </div>
+      <p class="error-msg" id="drop-error"></p>
+      <input type="file" id="file-input" accept="audio/*,.mp3,.wav,.m4a,.ogg" class="hidden">
+    </div>
+    <p class="note" style="text-align:center; margin-top:16px;">
+      変換はすべてこのページ内（Web Audio API）で完結します。URLからの取得機能はありません。
+    </p>
+  </section>
+
+  <!-- ===== 画面2: エディタ ===== -->
+  <section id="screen-editor" class="hidden">
+    <div class="panel file-bar">
+      <span>🎵 <span class="fname" id="file-name"></span></span>
+      <span class="note" id="file-info"></span>
+      <button id="btn-eject" class="small">別のファイルを開く</button>
+    </div>
+
+    <div class="wave-wrap">
+      <canvas id="wave"></canvas>
+    </div>
+    <div class="transport">
+      <button id="btn-play" class="primary">▶ 再生</button>
+      <button id="btn-bypass">原音と比較（バイパス: オフ）</button>
+      <span id="time-display">0:00 / 0:00</span>
+      <span class="note"><kbd>Space</kbd> 再生/停止　<kbd>1</kbd>–<kbd>5</kbd> プリセット</span>
+    </div>
+
+    <div class="tabs" role="tablist">
+      <button id="tab-a" class="active" role="tab" aria-selected="true">モードA: 8bitエフェクト</button>
+      <button id="tab-b" role="tab" aria-selected="false">モードB: ピコピコ再合成（実験室）</button>
+    </div>
+
+    <!-- モードA -->
+    <div class="tab-body" id="panel-a">
+      <div class="presets" id="preset-bar"></div>
+      <div class="param-row">
+        <label for="p-bits">ビット深度</label>
+        <input type="range" id="p-bits" min="1" max="8" step="1" value="4">
+        <output id="o-bits">4 bit</output>
+      </div>
+      <div class="param-row">
+        <label for="p-rate">サンプルレート低下</label>
+        <input type="range" id="p-rate" min="2000" max="16000" step="100" value="11000">
+        <output id="o-rate">11.0 kHz</output>
+      </div>
+      <div class="param-row">
+        <label for="p-mix">ミックス（原音⇔8bit）</label>
+        <input type="range" id="p-mix" min="0" max="100" step="1" value="100">
+        <output id="o-mix">100%</output>
+      </div>
+      <div class="param-row">
+        <label for="p-freq"><input type="checkbox" id="p-filter-on" checked> ローパスフィルタ</label>
+        <input type="range" id="p-freq" min="500" max="12000" step="100" value="8000">
+        <output id="o-freq">8.0 kHz</output>
+      </div>
+      <div class="row-actions">
+        <button id="btn-save-preset" class="small">現在の設定をプリセット保存</button>
+        <span class="note" id="worklet-note"></span>
+      </div>
+    </div>
+
+    <!-- モードB -->
+    <div class="tab-body hidden" id="panel-b">
+      <p class="note">
+        歌・口笛・単音楽器の録音からメロディを検出し、チップシンセで鳴らし直す実験機能です。
+        <strong>単音の音源限定</strong>（ミックス済みの市販曲では正しく検出できません）。解析は先頭120秒まで。
+      </p>
+      <div class="row-actions">
+        <button id="btn-analyze" class="primary">この音源を解析する</button>
+        <span class="note" id="analyze-status"></span>
+      </div>
+      <div class="progress-wrap hidden" id="progress-wrap"><div id="analyze-progress"></div></div>
+      <canvas id="pianoroll" class="hidden"></canvas>
+      <div id="chip-controls" class="hidden">
+        <div class="param-row">
+          <label for="c-wave">波形</label>
+          <select id="c-wave">
+            <option value="square50">矩形波 50%（ファミコン風）</option>
+            <option value="square25">矩形波 25%（細めの音）</option>
+            <option value="triangle">三角波（やわらかい）</option>
+          </select>
+          <span></span>
+        </div>
+        <div class="param-row">
+          <label for="c-vibrato">ビブラート</label>
+          <input type="range" id="c-vibrato" min="0" max="100" step="1" value="20">
+          <output id="o-vibrato">20%</output>
+        </div>
+        <div class="param-row">
+          <label for="c-decay">減衰（音の切れ）</label>
+          <input type="range" id="c-decay" min="0" max="100" step="1" value="40">
+          <output id="o-decay">40%</output>
+        </div>
+        <div class="row-actions">
+          <button id="btn-chip-play" class="primary">▶ ピコピコ再生</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="row-actions" style="margin-top:24px;">
+      <button id="btn-export" class="primary">WAVで書き出す…</button>
+    </div>
+  </section>
+
+  <!-- ===== 書き出しダイアログ ===== -->
+  <dialog id="export-dialog">
+    <h2>WAVで書き出す</h2>
+    <p class="note" id="export-source-label"></p>
+    <div class="opt-row">
+      <input type="checkbox" id="e-mono" checked>
+      <label for="e-mono">モノラルで書き出す（8bit風にはこちらが「らしい」＆軽い）</label>
+    </div>
+    <div class="opt-row">
+      <label for="e-rate">サンプルレート</label>
+      <select id="e-rate">
+        <option value="44100">44.1 kHz（標準）</option>
+        <option value="22050" selected>22.05 kHz（推奨・軽量）</option>
+        <option value="11025">11.025 kHz（最小）</option>
+      </select>
+    </div>
+    <div class="copyright-note">
+      ⚠ 既存曲を変換した音源をSNS等で公開するには、権利者の許諾が必要です。
+      自作曲・権利をクリアした音源でお楽しみください。
+    </div>
+    <p class="error-msg" id="export-error"></p>
+    <div class="dialog-actions">
+      <button id="btn-export-cancel">キャンセル（Esc）</button>
+      <button id="btn-export-run" class="primary">書き出してダウンロード</button>
+    </div>
+  </dialog>
+</main>
+
+<footer>
+  ピコラボ ― 入力はローカルファイルのみ・変換はブラウザ内で完結・サーバー送信なし
+</footer>
+
+<script>
+"use strict";
+
+/* =====================================================================
+ * 純関数群（DSP・採譜・チップシンセ・WAV）
+ * tests/test.mjs がこの区間を抽出してNodeで実行する。
+ * DOM / Web Audio API に依存するコードをここに書かないこと。
+ * ===================================================================== */
+/* @pure-begin */
+
+// ---- ビットクラッシャー（dsp） ----
+
+// 量子化: L = 2^(bits-1) 段でスナップ（bits=1 で -1/0/1 の3値）
+function crushQuantize(x, bits) {
+  const levels = Math.pow(2, bits - 1);
+  let q = Math.round(x * levels) / levels;
+  if (q > 1) q = 1;
+  if (q < -1) q = -1;
+  return q;
+}
+
+function createCrushState(channels) {
+  return { phase: 1, held: new Float32Array(channels) };
+}
+
+// サンプルホールド＋量子化＋原音ミックス。
+// inputChs/outputChs: Float32Array の配列（チャンネルごと）。長さは任意
+// （Workletの128サンプルにも、書き出し時の全長バッファにも同じ実装を使う）。
+function processCrush(inputChs, outputChs, state, params, contextRate) {
+  const n = inputChs[0].length;
+  const nCh = inputChs.length;
+  const step = params.sampleRate / contextRate;
+  const mix = params.mix;
+  for (let i = 0; i < n; i++) {
+    state.phase += step;
+    if (state.phase >= 1) {
+      state.phase -= Math.floor(state.phase);
+      for (let ch = 0; ch < nCh; ch++) {
+        state.held[ch] = crushQuantize(inputChs[ch][i], params.bits);
+      }
+    }
+    for (let ch = 0; ch < nCh; ch++) {
+      outputChs[ch][i] = inputChs[ch][i] * (1 - mix) + state.held[ch] * mix;
+    }
+  }
+}
+
+// ---- WAVエンコード（export） ----
+
+// channels: Float32Array の配列 → 16bit PCM WAV の ArrayBuffer
+function encodeWavPcm16(channels, sampleRate) {
+  const nCh = channels.length;
+  const len = channels[0].length;
+  const blockAlign = nCh * 2;
+  const dataSize = len * blockAlign;
+  const buf = new ArrayBuffer(44 + dataSize);
+  const v = new DataView(buf);
+  const writeStr = (off, s) => { for (let i = 0; i < s.length; i++) v.setUint8(off + i, s.charCodeAt(i)); };
+  writeStr(0, "RIFF");
+  v.setUint32(4, 36 + dataSize, true);
+  writeStr(8, "WAVE");
+  writeStr(12, "fmt ");
+  v.setUint32(16, 16, true);
+  v.setUint16(20, 1, true);            // PCM
+  v.setUint16(22, nCh, true);
+  v.setUint32(24, sampleRate, true);
+  v.setUint32(28, sampleRate * blockAlign, true);
+  v.setUint16(32, blockAlign, true);
+  v.setUint16(34, 16, true);           // 16bit
+  writeStr(36, "data");
+  v.setUint32(40, dataSize, true);
+  let off = 44;
+  for (let i = 0; i < len; i++) {
+    for (let ch = 0; ch < nCh; ch++) {
+      let s = channels[ch][i];
+      if (s > 1) s = 1; else if (s < -1) s = -1;
+      v.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+      off += 2;
+    }
+  }
+  return buf;
+}
+
+// ---- 前処理 ----
+
+function mixToMono(channels) {
+  const n = channels[0].length;
+  const out = new Float32Array(n);
+  for (let ch = 0; ch < channels.length; ch++) {
+    const c = channels[ch];
+    for (let i = 0; i < n; i++) out[i] += c[i];
+  }
+  const g = 1 / channels.length;
+  for (let i = 0; i < n; i++) out[i] *= g;
+  return out;
+}
+
+// 整数間引き（box平均）でおよそ targetRate へ落とす。YINの計算量削減用
+function downsampleTo(data, srcRate, targetRate) {
+  const factor = Math.max(1, Math.round(srcRate / targetRate));
+  if (factor === 1) return { data, rate: srcRate };
+  const n = Math.floor(data.length / factor);
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    let sum = 0;
+    const base = i * factor;
+    for (let j = 0; j < factor; j++) sum += data[base + j];
+    out[i] = sum / factor;
+  }
+  return { data: out, rate: srcRate / factor };
+}
+
+function frameRms(frame) {
+  let sum = 0;
+  for (let i = 0; i < frame.length; i++) sum += frame[i] * frame[i];
+  return Math.sqrt(sum / frame.length);
+}
+
+// ---- ピッチ検出: YIN（transcribe） ----
+
+// 1フレームの基本周波数推定。検出できなければ null。
+// clarity = 1 - CMND最小値（1に近いほど確度が高い）
+function yinPitch(frame, sampleRate, fmin, fmax) {
+  const W = frame.length >> 1;
+  const tauMin = Math.max(2, Math.floor(sampleRate / fmax));
+  const tauMax = Math.min(W - 1, Math.ceil(sampleRate / fmin));
+  if (tauMax <= tauMin + 2) return null;
+
+  // 差分関数 d(tau)
+  const d = new Float32Array(tauMax + 1);
+  for (let tau = 1; tau <= tauMax; tau++) {
+    let sum = 0;
+    for (let j = 0; j < W; j++) {
+      const diff = frame[j] - frame[j + tau];
+      sum += diff * diff;
+    }
+    d[tau] = sum;
+  }
+  // 累積平均正規化差分 CMND
+  const cmnd = new Float32Array(tauMax + 1);
+  cmnd[0] = 1;
+  let running = 0;
+  for (let tau = 1; tau <= tauMax; tau++) {
+    running += d[tau];
+    cmnd[tau] = running > 0 ? (d[tau] * tau) / running : 1;
+  }
+  // 絶対しきい値: 最初に閾値を割った谷を採用
+  const THRESHOLD = 0.15;
+  let tau = -1;
+  for (let t = tauMin; t <= tauMax; t++) {
+    if (cmnd[t] < THRESHOLD) {
+      while (t + 1 <= tauMax && cmnd[t + 1] < cmnd[t]) t++;
+      tau = t;
+      break;
+    }
+  }
+  if (tau < 0) return null;
+
+  // 放物線補間でサブサンプル精度に
+  let betterTau = tau;
+  if (tau > 1 && tau < tauMax) {
+    const s0 = cmnd[tau - 1], s1 = cmnd[tau], s2 = cmnd[tau + 1];
+    const denom = 2 * (2 * s1 - s2 - s0);
+    if (Math.abs(denom) > 1e-12) betterTau = tau + (s2 - s0) / denom;
+  }
+  return { freq: sampleRate / betterTau, clarity: 1 - cmnd[tau] };
+}
+
+// ---- ノート化（transcribe） ----
+
+function freqToMidi(freq) {
+  return 69 + 12 * Math.log2(freq / 440);
+}
+
+function midiToFreq(midi) {
+  return 440 * Math.pow(2, (midi - 69) / 12);
+}
+
+// null混じりの数列にメディアンフィルタ。窓内の非nullが過半数未満なら null
+function medianFilterNullable(arr, windowSize) {
+  const half = windowSize >> 1;
+  const out = new Array(arr.length);
+  for (let i = 0; i < arr.length; i++) {
+    const vals = [];
+    for (let j = Math.max(0, i - half); j <= Math.min(arr.length - 1, i + half); j++) {
+      if (arr[j] !== null) vals.push(arr[j]);
+    }
+    if (vals.length * 2 <= windowSize) { out[i] = null; continue; }
+    vals.sort((a, b) => a - b);
+    out[i] = vals[Math.floor(vals.length / 2)];
+  }
+  return out;
+}
+
+// フレーム列 [{freq, clarity, rms} | null] → ノート列 [{start, dur, midi, vel}]
+function framesToNotes(frames, hopTime, opts) {
+  const o = Object.assign({ minDur: 0.06, minClarity: 0.5, midiLow: 24, midiHigh: 96 }, opts);
+  let maxRms = 0;
+  for (const f of frames) if (f && f.rms > maxRms) maxRms = f.rms;
+  const rmsGate = Math.max(0.005, maxRms * 0.08);
+
+  const midis = frames.map((f) => {
+    if (!f || !f.freq || f.clarity < o.minClarity || f.rms < rmsGate) return null;
+    const m = Math.round(freqToMidi(f.freq));
+    return (m >= o.midiLow && m <= o.midiHigh) ? m : null;
+  });
+  const smoothed = medianFilterNullable(midis, 5);
+
+  const notes = [];
+  let cur = null; // {midi, startIdx, count, rmsSum}
+  const flush = (endIdx) => {
+    if (!cur) return;
+    const dur = cur.count * hopTime;
+    if (dur >= o.minDur) {
+      notes.push({
+        start: cur.startIdx * hopTime,
+        dur,
+        midi: cur.midi,
+        rmsMean: cur.rmsSum / cur.count,
+      });
+    }
+    cur = null;
+  };
+  for (let i = 0; i < smoothed.length; i++) {
+    const m = smoothed[i];
+    const rms = frames[i] ? frames[i].rms : 0;
+    if (m === null) { flush(i); continue; }
+    if (cur && cur.midi === m) {
+      cur.count++; cur.rmsSum += rms;
+    } else {
+      flush(i);
+      cur = { midi: m, startIdx: i, count: 1, rmsSum: rms };
+    }
+  }
+  flush(smoothed.length);
+
+  // 音量 → ベロシティ（最大値基準で 0.3〜1.0）
+  let maxMean = 0;
+  for (const n of notes) if (n.rmsMean > maxMean) maxMean = n.rmsMean;
+  for (const n of notes) {
+    n.vel = maxMean > 0 ? 0.3 + 0.7 * (n.rmsMean / maxMean) : 0.8;
+    delete n.rmsMean;
+  }
+  return notes;
+}
+
+// ---- チップシンセ（chipsynth） ----
+
+// notes: [{start, dur, midi, vel}] → モノラル Float32Array
+// settings: { wave: "square50"|"square25"|"triangle", vibrato: 0..1, decay: 0..1 }
+function renderChip(notes, settings, sampleRate) {
+  let total = 0.5;
+  for (const n of notes) total = Math.max(total, n.start + n.dur + 0.3);
+  const out = new Float32Array(Math.ceil(total * sampleRate));
+  const vibDepthSemi = settings.vibrato * 0.5;   // 最大±0.5半音
+  const vibRate = 5.5;
+  const decayTime = 1.5 - settings.decay * 1.4;  // 0→1.5s(伸びる) 1→0.1s(プチッ)
+  const ATTACK = 0.005, RELEASE = 0.02;
+  const duty = settings.wave === "square25" ? 0.25 : 0.5;
+
+  for (const note of notes) {
+    const startIdx = Math.floor(note.start * sampleRate);
+    const durSamples = Math.floor((note.dur + RELEASE) * sampleRate);
+    const baseFreq = midiToFreq(note.midi);
+    let phase = 0;
+    for (let i = 0; i < durSamples; i++) {
+      const idx = startIdx + i;
+      if (idx >= out.length) break;
+      const t = i / sampleRate;
+      // ビブラート（かかり始めは0.15秒かけて立ち上げ）
+      const vibRamp = Math.min(1, t / 0.15);
+      const semi = vibDepthSemi * vibRamp * Math.sin(2 * Math.PI * vibRate * t);
+      const freq = baseFreq * Math.pow(2, semi / 12);
+      phase += freq / sampleRate;
+      const p = phase - Math.floor(phase);
+      let raw;
+      if (settings.wave === "triangle") {
+        raw = p < 0.5 ? 4 * p - 1 : 3 - 4 * p;
+      } else {
+        // 矩形波はデューティ比によるDCオフセットを除去して中心化
+        raw = (p < duty ? 1 : -1) - (2 * duty - 1);
+      }
+      // エンベロープ: アタック → 指数減衰 → ノート末尾でリリース
+      let env = Math.exp(-t / decayTime);
+      if (t < ATTACK) env *= t / ATTACK;
+      const tail = note.dur + RELEASE - t;
+      if (tail < RELEASE) env *= Math.max(0, tail / RELEASE);
+      out[idx] += raw * env * note.vel * 0.25;
+    }
+  }
+  // クリップ防止の正規化
+  let peak = 0;
+  for (let i = 0; i < out.length; i++) { const a = Math.abs(out[i]); if (a > peak) peak = a; }
+  if (peak > 0.95) {
+    const g = 0.95 / peak;
+    for (let i = 0; i < out.length; i++) out[i] *= g;
+  }
+  return out;
+}
+
+// ---- デモ音源（自作フレーズをその場で合成。音源ファイルは同梱しない） ----
+
+function buildDemoNotes() {
+  const EIGHTH = 0.22; // ≒136BPMの8分音符
+  const melodyMidi = [
+    69, 72, 76, 79, 81, 79, 76, 72,   // Am
+    77, 81, 84, 81, 77, 76, 74, 72,   // F
+    74, 77, 81, 77, 74, 72, 71, 69,   // Dm
+    71, 74, 79, 74, 76, 0, 76, 0,     // E
+  ];
+  const bassMidi = [45, 41, 38, 40]; // A2 F2 D2 E2（1小節ずつ）
+  const melody = [];
+  melodyMidi.forEach((m, i) => {
+    if (m > 0) melody.push({ start: i * EIGHTH, dur: EIGHTH * 0.9, midi: m, vel: 0.85 });
+  });
+  const bass = bassMidi.map((m, i) => ({ start: i * 8 * EIGHTH, dur: 8 * EIGHTH * 0.95, midi: m, vel: 0.9 }));
+  return { melody, bass };
+}
+
+function renderDemoSong(sampleRate) {
+  const { melody, bass } = buildDemoNotes();
+  const a = renderChip(melody, { wave: "square50", vibrato: 0.15, decay: 0.25 }, sampleRate);
+  const b = renderChip(bass, { wave: "triangle", vibrato: 0, decay: 0.1 }, sampleRate);
+  const n = Math.max(a.length, b.length);
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) out[i] = (i < a.length ? a[i] : 0) * 0.7 + (i < b.length ? b[i] : 0) * 0.55;
+  return out;
+}
+
+// ---- プリセット（data） ----
+
+const BUILTIN_PRESETS = [
+  { name: "ファミコン風",   params: { bits: 4, sampleRate: 11000, mix: 1.0,  filterOn: true,  filterFreq: 8000 } },
+  { name: "ゲームボーイ風", params: { bits: 3, sampleRate: 8000,  mix: 1.0,  filterOn: true,  filterFreq: 5200 } },
+  { name: "壊れかけラジオ", params: { bits: 5, sampleRate: 5500,  mix: 1.0,  filterOn: true,  filterFreq: 2400 } },
+  { name: "ロボット",       params: { bits: 2, sampleRate: 4000,  mix: 1.0,  filterOn: true,  filterFreq: 3600 } },
+  { name: "うっすらレトロ", params: { bits: 6, sampleRate: 16000, mix: 0.55, filterOn: false, filterFreq: 12000 } },
+];
+
+/* Node テスト用エクスポート（ブラウザでは単に未使用のオブジェクト） */
+const PURE = {
+  crushQuantize, createCrushState, processCrush, encodeWavPcm16,
+  mixToMono, downsampleTo, frameRms, yinPitch, freqToMidi, midiToFreq,
+  medianFilterNullable, framesToNotes, renderChip, buildDemoNotes, renderDemoSong,
+  BUILTIN_PRESETS,
+};
+if (typeof module !== "undefined" && module.exports) module.exports = PURE;
+
+/* @pure-end */
+
+/* =====================================================================
+ * ここから下はブラウザ専用（DOM / Web Audio）
+ * ===================================================================== */
+
+/* ===== 定数 ===== */
+const MAX_DURATION_SEC = 600;      // 10分制限（design.md リスク3）
+const ANALYZE_LIMIT_SEC = 120;     // モードB解析上限
+const ANALYZE_TARGET_RATE = 11025; // YIN用ダウンサンプル先
+const YIN_FRAME = 1024;
+const STORAGE_KEY = "picolab.settings";
+
+/* ===== 状態管理 ===== */
+const app = {
+  ctx: null,
+  workletReady: false,
+  crusherNode: null,       // AudioWorkletNode または ScriptProcessorNode
+  filterNode: null,
+  masterGain: null,
+  spState: null,           // ScriptProcessorフォールバック用のcrush状態
+
+  buffer: null,            // 読み込んだ AudioBuffer
+  fileName: "",
+  source: null,            // 再生中の BufferSource
+  playing: false,
+  playingChip: false,      // モードB再生中か
+  startedAt: 0,
+  offset: 0,
+  bypass: false,
+  wavePeaks: null,
+
+  params: { bits: 4, sampleRate: 11000, mix: 1.0, filterOn: true, filterFreq: 8000 },
+  chip: { wave: "square50", vibrato: 0.2, decay: 0.4 },
+  userPresets: [],
+  activePresetName: "ファミコン風",
+
+  notes: null,             // モードBの解析結果
+  chipBuffer: null,        // renderChip 済み AudioBuffer
+  analyzing: false,
+  analyzedTruncated: false,
+};
+
+/* ===== DOMショートカット ===== */
+const $ = (id) => document.getElementById(id);
+const screenDrop = $("screen-drop"), screenEditor = $("screen-editor");
+const exportDialog = $("export-dialog");
+
+/* ===== オーディオ初期化 ===== */
+
+// Workletのコードは純関数のソースを文字列連結してBlob URLで登録する
+// （単一HTML成立の要。design.md リスク1）
+function buildWorkletSource() {
+  return [
+    crushQuantize.toString(),
+    createCrushState.toString(),
+    processCrush.toString(),
+    `class PicolabCrusher extends AudioWorkletProcessor {
+      constructor() {
+        super();
+        this.params = { bits: 4, sampleRate: 11000, mix: 1 };
+        this.state = null;
+        this.port.onmessage = (e) => { Object.assign(this.params, e.data); };
+      }
+      process(inputs, outputs) {
+        const input = inputs[0], output = outputs[0];
+        if (!input || input.length === 0) return true;
+        if (!this.state || this.state.held.length !== input.length) {
+          this.state = createCrushState(input.length);
+        }
+        processCrush(input, output, this.state, this.params, sampleRate);
+        return true;
+      }
+    }
+    registerProcessor("picolab-crusher", PicolabCrusher);`,
+  ].join("\n");
+}
+
+async function ensureAudio() {
+  if (app.ctx) {
+    if (app.ctx.state === "suspended") await app.ctx.resume();
+    return;
+  }
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) throw new Error("このブラウザはWeb Audio APIに対応していません");
+  app.ctx = new AC();
+
+  app.masterGain = app.ctx.createGain();
+  app.masterGain.gain.value = 0.9;
+  app.masterGain.connect(app.ctx.destination);
+
+  app.filterNode = app.ctx.createBiquadFilter();
+  app.filterNode.type = "lowpass";
+  app.filterNode.frequency.value = app.params.filterFreq;
+
+  // AudioWorklet: Blob URL → 不可なら data: URL → それも不可なら ScriptProcessor。
+  // file:// で開いた場合、Blob URLのWorklet読み込みは拒否されるが data: URL は通る
+  // （ヘッドレスEdgeで検証済み。http(s)ではBlob URLで通る）
+  const workletSource = buildWorkletSource();
+  let workletLoaded = false;
+  try {
+    const url = URL.createObjectURL(new Blob([workletSource], { type: "text/javascript" }));
+    await app.ctx.audioWorklet.addModule(url);
+    URL.revokeObjectURL(url);
+    workletLoaded = true;
+  } catch (err) {
+    try {
+      await app.ctx.audioWorklet.addModule(
+        "data:text/javascript;base64," + btoa(unescape(encodeURIComponent(workletSource))));
+      workletLoaded = true;
+    } catch (err2) {
+      console.warn("AudioWorklet不可、ScriptProcessorにフォールバック:", err2);
+    }
+  }
+  if (workletLoaded) {
+    app.crusherNode = new AudioWorkletNode(app.ctx, "picolab-crusher", {
+      numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2],
+    });
+    app.workletReady = true;
+  } else {
+    const sp = app.ctx.createScriptProcessor(4096, 2, 2);
+    app.spState = createCrushState(2);
+    sp.onaudioprocess = (e) => {
+      const inChs = [], outChs = [];
+      for (let ch = 0; ch < e.inputBuffer.numberOfChannels; ch++) {
+        inChs.push(e.inputBuffer.getChannelData(ch));
+        outChs.push(e.outputBuffer.getChannelData(ch));
+      }
+      processCrush(inChs, outChs, app.spState, {
+        bits: app.params.bits, sampleRate: app.params.sampleRate, mix: app.params.mix,
+      }, app.ctx.sampleRate);
+    };
+    app.crusherNode = sp;
+    app.workletReady = false;
+    $("worklet-note").textContent = "※互換モード（ScriptProcessor）で動作中";
+  }
+  reconnectChain();
+  pushParamsToCrusher();
+}
+
+// crusher → (filter) → master の接続を組み直す（フィルタON/OFF切替時にも呼ぶ）
+function reconnectChain() {
+  app.crusherNode.disconnect();
+  app.filterNode.disconnect();
+  if (app.params.filterOn) {
+    app.crusherNode.connect(app.filterNode);
+    app.filterNode.connect(app.masterGain);
+  } else {
+    app.crusherNode.connect(app.masterGain);
+  }
+}
+
+function pushParamsToCrusher() {
+  if (!app.ctx) return;
+  if (app.workletReady) {
+    app.crusherNode.port.postMessage({
+      bits: app.params.bits, sampleRate: app.params.sampleRate, mix: app.params.mix,
+    });
+  }
+  // ScriptProcessor版は app.params を直接読むので送信不要
+  app.filterNode.frequency.setTargetAtTime(app.params.filterFreq, app.ctx.currentTime, 0.02);
+}
+
+/* ===== ファイル読み込み ===== */
+
+async function loadFile(file) {
+  $("drop-error").textContent = "";
+  try {
+    await ensureAudio();
+    const arrayBuf = await file.arrayBuffer();
+    const buffer = await app.ctx.decodeAudioData(arrayBuf);
+    if (buffer.duration > MAX_DURATION_SEC) {
+      throw new Error(`ファイルが長すぎます（${Math.round(buffer.duration / 60)}分）。10分以内の音源にしてください`);
+    }
+    setBuffer(buffer, file.name);
+  } catch (err) {
+    $("drop-error").textContent =
+      err && err.message && err.message.includes("10分")
+        ? err.message
+        : "読み込めませんでした。対応形式（mp3/wav/m4a/ogg）か確認してください";
+    console.error(err);
+  }
+}
+
+async function loadDemo() {
+  $("drop-error").textContent = "";
+  try {
+    await ensureAudio();
+    const data = renderDemoSong(app.ctx.sampleRate);
+    const buffer = app.ctx.createBuffer(1, data.length, app.ctx.sampleRate);
+    buffer.copyToChannel(data, 0);
+    setBuffer(buffer, "デモ音源（自作フレーズ・その場で合成）");
+  } catch (err) {
+    $("drop-error").textContent = "音声エンジンを初期化できませんでした";
+    console.error(err);
+  }
+}
+
+function setBuffer(buffer, name) {
+  stopPlayback();
+  stopChipPlayback();
+  app.buffer = buffer;
+  app.fileName = name;
+  app.offset = 0;
+  app.notes = null;
+  app.chipBuffer = null;
+  app.wavePeaks = computePeaks(buffer, 1200);
+
+  $("file-name").textContent = name;
+  const min = Math.floor(buffer.duration / 60), sec = Math.round(buffer.duration % 60);
+  $("file-info").textContent =
+    `${min}:${String(sec).padStart(2, "0")} / ${buffer.numberOfChannels}ch / ${buffer.sampleRate}Hz`;
+
+  // モードBの結果をリセット
+  $("pianoroll").classList.add("hidden");
+  $("chip-controls").classList.add("hidden");
+  $("analyze-status").textContent = "";
+  $("progress-wrap").classList.add("hidden");
+
+  screenDrop.classList.add("hidden");
+  screenEditor.classList.remove("hidden");
+  resizeCanvases();
+  drawWave();
+  updateTimeDisplay();
+}
+
+function ejectFile() {
+  stopPlayback();
+  stopChipPlayback();
+  app.buffer = null;
+  screenEditor.classList.add("hidden");
+  screenDrop.classList.remove("hidden");
+}
+
+/* ===== 波形表示 ===== */
+
+function computePeaks(buffer, bins) {
+  const data = buffer.getChannelData(0);
+  const per = Math.max(1, Math.floor(data.length / bins));
+  const peaks = [];
+  for (let i = 0; i < bins; i++) {
+    let min = 1, max = -1;
+    const base = i * per;
+    if (base >= data.length) break;
+    const end = Math.min(data.length, base + per);
+    for (let j = base; j < end; j++) {
+      const s = data[j];
+      if (s < min) min = s;
+      if (s > max) max = s;
+    }
+    peaks.push([min, max]);
+  }
+  return peaks;
+}
+
+function resizeCanvases() {
+  for (const id of ["wave", "pianoroll"]) {
+    const c = $(id);
+    const rect = c.getBoundingClientRect();
+    if (rect.width > 0) {
+      c.width = Math.round(rect.width * (window.devicePixelRatio || 1));
+      c.height = Math.round(parseInt(getComputedStyle(c).height) * (window.devicePixelRatio || 1));
+    }
+  }
+}
+
+function drawWave() {
+  const c = $("wave");
+  const g = c.getContext("2d");
+  g.clearRect(0, 0, c.width, c.height);
+  if (!app.wavePeaks) return;
+  const mid = c.height / 2;
+  const w = c.width / app.wavePeaks.length;
+  g.fillStyle = "#3a4a7a";
+  for (let i = 0; i < app.wavePeaks.length; i++) {
+    const [min, max] = app.wavePeaks[i];
+    const y1 = mid - max * mid * 0.9;
+    const y2 = mid - min * mid * 0.9;
+    g.fillRect(i * w, y1, Math.max(1, w - 0.5), Math.max(1, y2 - y1));
+  }
+  // 再生ヘッド
+  if (app.buffer) {
+    const pos = currentPosition() / app.buffer.duration;
+    g.fillStyle = "#6ee787";
+    g.fillRect(pos * c.width - 1, 0, 2, c.height);
+  }
+}
+
+function currentPosition() {
+  if (!app.buffer) return 0;
+  const pos = app.playing ? app.offset + (app.ctx.currentTime - app.startedAt) : app.offset;
+  return Math.min(pos, app.buffer.duration);
+}
+
+function fmtTime(t) {
+  const m = Math.floor(t / 60), s = Math.floor(t % 60);
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function updateTimeDisplay() {
+  if (!app.buffer) return;
+  $("time-display").textContent = `${fmtTime(currentPosition())} / ${fmtTime(app.buffer.duration)}`;
+}
+
+function rafLoop() {
+  if (app.playing) {
+    drawWave();
+    updateTimeDisplay();
+  }
+  requestAnimationFrame(rafLoop);
+}
+
+/* ===== 再生制御 ===== */
+
+async function togglePlayback() {
+  if (!app.buffer) return;
+  if (app.playing) { stopPlayback(); return; }
+  await ensureAudio();
+  stopChipPlayback();
+  if (app.offset >= app.buffer.duration - 0.05) app.offset = 0;
+
+  const src = app.ctx.createBufferSource();
+  src.buffer = app.buffer;
+  src.connect(app.bypass ? app.masterGain : app.crusherNode);
+  src.start(0, app.offset);
+  app.source = src;
+  app.playing = true;
+  app.startedAt = app.ctx.currentTime;
+  src.onended = () => {
+    // 手動stop時はstopPlayback側で処理済み。自然終了だけ拾う
+    if (app.source === src && app.playing) {
+      app.offset = 0;
+      app.playing = false;
+      app.source = null;
+      updatePlayButton();
+      drawWave();
+      updateTimeDisplay();
+    }
+  };
+  updatePlayButton();
+}
+
+function stopPlayback() {
+  if (app.source) {
+    const src = app.source;
+    app.offset = currentPosition();
+    app.playing = false;
+    app.source = null;
+    try { src.stop(); } catch (e) { /* 二重stopは無視 */ }
+  }
+  app.playing = false;
+  updatePlayButton();
+  drawWave();
+  updateTimeDisplay();
+}
+
+function updatePlayButton() {
+  $("btn-play").textContent = app.playing ? "■ 停止" : "▶ 再生";
+}
+
+function seekTo(fraction) {
+  if (!app.buffer) return;
+  const wasPlaying = app.playing;
+  stopPlayback();
+  app.offset = Math.max(0, Math.min(1, fraction)) * app.buffer.duration;
+  drawWave();
+  updateTimeDisplay();
+  if (wasPlaying) togglePlayback();
+}
+
+function toggleBypass() {
+  app.bypass = !app.bypass;
+  $("btn-bypass").textContent = `原音と比較（バイパス: ${app.bypass ? "オン" : "オフ"}）`;
+  if (app.playing && app.source) {
+    app.source.disconnect();
+    app.source.connect(app.bypass ? app.masterGain : app.crusherNode);
+  }
+}
+
+/* ===== モードA: パラメータUI ===== */
+
+function bindParamControls() {
+  const sync = () => {
+    app.params.bits = Number($("p-bits").value);
+    app.params.sampleRate = Number($("p-rate").value);
+    app.params.mix = Number($("p-mix").value) / 100;
+    app.params.filterOn = $("p-filter-on").checked;
+    app.params.filterFreq = Number($("p-freq").value);
+    updateParamOutputs();
+    if (app.ctx) { pushParamsToCrusher(); reconnectChain(); }
+    markPresetActive(null);
+    saveSettingsDebounced();
+  };
+  for (const id of ["p-bits", "p-rate", "p-mix", "p-freq"]) $(id).addEventListener("input", sync);
+  $("p-filter-on").addEventListener("change", sync);
+}
+
+function updateParamOutputs() {
+  $("o-bits").textContent = `${app.params.bits} bit`;
+  $("o-rate").textContent = `${(app.params.sampleRate / 1000).toFixed(1)} kHz`;
+  $("o-mix").textContent = `${Math.round(app.params.mix * 100)}%`;
+  $("o-freq").textContent = `${(app.params.filterFreq / 1000).toFixed(1)} kHz`;
+  $("p-freq").disabled = !app.params.filterOn;
+}
+
+function applyParamsToControls() {
+  $("p-bits").value = app.params.bits;
+  $("p-rate").value = app.params.sampleRate;
+  $("p-mix").value = Math.round(app.params.mix * 100);
+  $("p-filter-on").checked = app.params.filterOn;
+  $("p-freq").value = app.params.filterFreq;
+  updateParamOutputs();
+}
+
+function applyPreset(preset) {
+  app.params = Object.assign({}, preset.params);
+  applyParamsToControls();
+  if (app.ctx) { pushParamsToCrusher(); reconnectChain(); }
+  markPresetActive(preset.name);
+  saveSettingsDebounced();
+}
+
+function markPresetActive(name) {
+  app.activePresetName = name;
+  document.querySelectorAll("#preset-bar button").forEach((b) => {
+    b.classList.toggle("active-preset", b.dataset.preset === name);
+  });
+}
+
+function renderPresetBar() {
+  const bar = $("preset-bar");
+  bar.innerHTML = "";
+  BUILTIN_PRESETS.forEach((p, i) => {
+    const b = document.createElement("button");
+    b.className = "small";
+    b.dataset.preset = p.name;
+    b.textContent = `${i + 1}. ${p.name}`;
+    b.addEventListener("click", () => applyPreset(p));
+    bar.appendChild(b);
+  });
+  app.userPresets.forEach((p) => {
+    const b = document.createElement("button");
+    b.className = "small";
+    b.dataset.preset = p.name;
+    b.textContent = `★ ${p.name}`;
+    b.title = "クリックで適用 / 右クリックで削除";
+    b.addEventListener("click", () => applyPreset(p));
+    b.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      if (confirm(`プリセット「${p.name}」を削除しますか？`)) {
+        app.userPresets = app.userPresets.filter((x) => x.name !== p.name);
+        renderPresetBar();
+        saveSettingsDebounced();
+      }
+    });
+    bar.appendChild(b);
+  });
+  markPresetActive(app.activePresetName);
+}
+
+function saveUserPreset() {
+  const name = prompt("プリセット名を入力してください", "マイプリセット");
+  if (!name) return;
+  app.userPresets = app.userPresets.filter((x) => x.name !== name);
+  app.userPresets.push({ name, params: Object.assign({}, app.params) });
+  renderPresetBar();
+  markPresetActive(name);
+  saveSettingsDebounced();
+}
+
+/* ===== モードB: 解析（transcribe）と再合成（chipsynth） ===== */
+
+async function analyzeCurrentBuffer() {
+  if (!app.buffer || app.analyzing) return;
+  app.analyzing = true;
+  $("btn-analyze").disabled = true;
+  $("analyze-status").textContent = "解析中…";
+  $("progress-wrap").classList.remove("hidden");
+  $("analyze-progress").style.width = "0%";
+  stopChipPlayback();
+
+  try {
+    const channels = [];
+    for (let ch = 0; ch < app.buffer.numberOfChannels; ch++) channels.push(app.buffer.getChannelData(ch));
+    let mono = mixToMono(channels);
+    app.analyzedTruncated = app.buffer.duration > ANALYZE_LIMIT_SEC;
+    if (app.analyzedTruncated) {
+      mono = mono.subarray(0, Math.floor(ANALYZE_LIMIT_SEC * app.buffer.sampleRate));
+    }
+    const ds = downsampleTo(mono, app.buffer.sampleRate, ANALYZE_TARGET_RATE);
+    const hop = Math.round(ds.rate * 0.01); // 10ms
+    const totalFrames = Math.max(0, Math.floor((ds.data.length - YIN_FRAME) / hop));
+    const frames = [];
+    const CHUNK = 200;
+
+    for (let f = 0; f < totalFrames; f += CHUNK) {
+      const end = Math.min(totalFrames, f + CHUNK);
+      for (let i = f; i < end; i++) {
+        const frame = ds.data.subarray(i * hop, i * hop + YIN_FRAME);
+        const pitch = yinPitch(frame, ds.rate, 70, 1200);
+        frames.push(pitch ? { freq: pitch.freq, clarity: pitch.clarity, rms: frameRms(frame) } : null);
+      }
+      $("analyze-progress").style.width = `${Math.round((end / totalFrames) * 100)}%`;
+      // UIを固めないため1チャンクごとにイベントループへ返す
+      await new Promise((r) => setTimeout(r, 0));
+    }
+
+    app.notes = framesToNotes(frames, hop / ds.rate, {});
+    app.chipBuffer = null;
+
+    if (app.notes.length === 0) {
+      $("analyze-status").textContent = "ノートを検出できませんでした（単音の録音向けの機能です）";
+      $("pianoroll").classList.add("hidden");
+      $("chip-controls").classList.add("hidden");
+    } else {
+      $("analyze-status").textContent =
+        `${app.notes.length}個のノートを検出` + (app.analyzedTruncated ? "（先頭120秒のみ解析）" : "");
+      $("pianoroll").classList.remove("hidden");
+      $("chip-controls").classList.remove("hidden");
+      resizeCanvases();
+      drawPianoroll();
+    }
+  } catch (err) {
+    $("analyze-status").textContent = "解析中にエラーが発生しました";
+    console.error(err);
+  } finally {
+    app.analyzing = false;
+    $("btn-analyze").disabled = false;
+    $("progress-wrap").classList.add("hidden");
+  }
+}
+
+function drawPianoroll() {
+  const c = $("pianoroll");
+  const g = c.getContext("2d");
+  g.clearRect(0, 0, c.width, c.height);
+  if (!app.notes || app.notes.length === 0) return;
+  let minMidi = 127, maxMidi = 0, maxT = 0.1;
+  for (const n of app.notes) {
+    if (n.midi < minMidi) minMidi = n.midi;
+    if (n.midi > maxMidi) maxMidi = n.midi;
+    if (n.start + n.dur > maxT) maxT = n.start + n.dur;
+  }
+  minMidi -= 2; maxMidi += 2;
+  const rows = maxMidi - minMidi + 1;
+  const rowH = c.height / rows;
+  // オクターブの目安線（C）
+  g.fillStyle = "rgba(255,255,255,0.05)";
+  for (let m = minMidi; m <= maxMidi; m++) {
+    if (m % 12 === 0) g.fillRect(0, c.height - (m - minMidi + 1) * rowH, c.width, 1);
+  }
+  g.fillStyle = "#6ee787";
+  for (const n of app.notes) {
+    const x = (n.start / maxT) * c.width;
+    const w = Math.max(2, (n.dur / maxT) * c.width - 1);
+    const y = c.height - (n.midi - minMidi + 1) * rowH;
+    g.globalAlpha = 0.5 + 0.5 * n.vel;
+    g.fillRect(x, y, w, Math.max(2, rowH - 1));
+  }
+  g.globalAlpha = 1;
+}
+
+function bindChipControls() {
+  const sync = () => {
+    app.chip.wave = $("c-wave").value;
+    app.chip.vibrato = Number($("c-vibrato").value) / 100;
+    app.chip.decay = Number($("c-decay").value) / 100;
+    $("o-vibrato").textContent = `${$("c-vibrato").value}%`;
+    $("o-decay").textContent = `${$("c-decay").value}%`;
+    app.chipBuffer = null; // 設定が変わったので再レンダリングが必要
+    saveSettingsDebounced();
+  };
+  $("c-wave").addEventListener("change", sync);
+  $("c-vibrato").addEventListener("input", sync);
+  $("c-decay").addEventListener("input", sync);
+}
+
+function applyChipToControls() {
+  $("c-wave").value = app.chip.wave;
+  $("c-vibrato").value = Math.round(app.chip.vibrato * 100);
+  $("c-decay").value = Math.round(app.chip.decay * 100);
+  $("o-vibrato").textContent = `${Math.round(app.chip.vibrato * 100)}%`;
+  $("o-decay").textContent = `${Math.round(app.chip.decay * 100)}%`;
+}
+
+let chipSource = null;
+async function toggleChipPlayback() {
+  if (app.playingChip) { stopChipPlayback(); return; }
+  if (!app.notes || app.notes.length === 0) return;
+  await ensureAudio();
+  stopPlayback();
+  if (!app.chipBuffer) {
+    const data = renderChip(app.notes, app.chip, app.ctx.sampleRate);
+    app.chipBuffer = app.ctx.createBuffer(1, data.length, app.ctx.sampleRate);
+    app.chipBuffer.copyToChannel(data, 0);
+  }
+  const src = app.ctx.createBufferSource();
+  src.buffer = app.chipBuffer;
+  src.connect(app.masterGain); // チップ音はクラッシャーを通さずそのまま
+  src.start();
+  chipSource = src;
+  app.playingChip = true;
+  $("btn-chip-play").textContent = "■ 停止";
+  src.onended = () => {
+    if (chipSource === src) {
+      app.playingChip = false;
+      chipSource = null;
+      $("btn-chip-play").textContent = "▶ ピコピコ再生";
+    }
+  };
+}
+
+function stopChipPlayback() {
+  if (chipSource) {
+    const src = chipSource;
+    chipSource = null;
+    app.playingChip = false;
+    try { src.stop(); } catch (e) { /* 二重stopは無視 */ }
+  }
+  app.playingChip = false;
+  $("btn-chip-play").textContent = "▶ ピコピコ再生";
+}
+
+/* ===== タブ ===== */
+
+function switchTab(tab) {
+  app.activeTab = tab;
+  $("tab-a").classList.toggle("active", tab === "a");
+  $("tab-b").classList.toggle("active", tab === "b");
+  $("tab-a").setAttribute("aria-selected", tab === "a");
+  $("tab-b").setAttribute("aria-selected", tab === "b");
+  $("panel-a").classList.toggle("hidden", tab !== "a");
+  $("panel-b").classList.toggle("hidden", tab !== "b");
+  if (tab === "b" && app.notes && app.notes.length > 0) {
+    resizeCanvases();
+    drawPianoroll();
+  }
+}
+
+/* ===== 書き出し（export） ===== */
+
+function openExportDialog() {
+  if (!app.buffer) return;
+  const isChip = app.activeTab === "b";
+  if (isChip && (!app.notes || app.notes.length === 0)) {
+    $("analyze-status").textContent = "書き出す前に「この音源を解析する」を実行してください";
+    return;
+  }
+  $("export-source-label").textContent = isChip
+    ? "書き出す内容: モードB（ピコピコ再合成・モノラル固定）"
+    : "書き出す内容: モードA（現在のパラメータで8bitエフェクトを適用）";
+  $("e-mono").disabled = isChip;
+  if (isChip) $("e-mono").checked = true;
+  $("export-error").textContent = "";
+  exportDialog.showModal();
+}
+
+async function runExport() {
+  const btn = $("btn-export-run");
+  btn.disabled = true;
+  btn.textContent = "書き出し中…";
+  $("export-error").textContent = "";
+  try {
+    const outRate = Number($("e-rate").value);
+    const mono = $("e-mono").checked;
+    let channels, suffix;
+
+    if (app.activeTab === "b") {
+      // モードB: チップシンセを目的レートで直接レンダリング（常にモノラル）
+      channels = [renderChip(app.notes, app.chip, outRate)];
+      suffix = "picopico";
+    } else {
+      // モードA: 純関数でクラッシュ → OfflineAudioContextでフィルタ＋リサンプル
+      const srcChs = [];
+      for (let ch = 0; ch < app.buffer.numberOfChannels; ch++) srcChs.push(app.buffer.getChannelData(ch));
+      const crushed = srcChs.map((c) => new Float32Array(c.length));
+      processCrush(srcChs, crushed, createCrushState(srcChs.length), {
+        bits: app.params.bits, sampleRate: app.params.sampleRate, mix: app.params.mix,
+      }, app.buffer.sampleRate);
+
+      const outCh = mono ? 1 : app.buffer.numberOfChannels;
+      const off = new OfflineAudioContext(outCh, Math.ceil(app.buffer.duration * outRate), outRate);
+      const buf = off.createBuffer(crushed.length, crushed[0].length, app.buffer.sampleRate);
+      crushed.forEach((c, i) => buf.copyToChannel(c, i));
+      const src = off.createBufferSource();
+      src.buffer = buf;
+      if (app.params.filterOn) {
+        const filt = off.createBiquadFilter();
+        filt.type = "lowpass";
+        filt.frequency.value = app.params.filterFreq;
+        src.connect(filt);
+        filt.connect(off.destination);
+      } else {
+        src.connect(off.destination);
+      }
+      src.start();
+      const rendered = await off.startRendering();
+      channels = [];
+      for (let ch = 0; ch < rendered.numberOfChannels; ch++) channels.push(rendered.getChannelData(ch));
+      suffix = "8bit";
+    }
+
+    const wav = encodeWavPcm16(channels, outRate);
+    const base = (app.fileName.replace(/\.[^.]+$/, "") || "picolab")
+      .replace(/[\\/:*?"<>|]/g, "_").slice(0, 60);
+    const blob = new Blob([wav], { type: "audio/wav" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${base}_${suffix}.wav`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    exportDialog.close();
+  } catch (err) {
+    $("export-error").textContent = "書き出しに失敗しました。設定を変えて再試行してください";
+    console.error(err);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "書き出してダウンロード";
+  }
+}
+
+/* ===== 設定の永続化（localStorage） ===== */
+
+let saveTimer = null;
+function saveSettingsDebounced() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({
+        params: app.params, chip: app.chip, userPresets: app.userPresets,
+      }));
+    } catch (e) { /* プライベートブラウズ等で失敗しても動作継続 */ }
+  }, 300);
+}
+
+function loadSettings() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return;
+    const s = JSON.parse(raw);
+    if (s.params && typeof s.params.bits === "number") app.params = Object.assign({}, app.params, s.params);
+    if (s.chip && typeof s.chip.wave === "string") app.chip = Object.assign({}, app.chip, s.chip);
+    if (Array.isArray(s.userPresets)) app.userPresets = s.userPresets;
+    app.activePresetName = null;
+  } catch (e) { /* 壊れた保存データは無視して既定値で起動 */ }
+}
+
+/* ===== イベント配線 ===== */
+
+function bindEvents() {
+  // ドロップゾーン
+  const dz = $("dropzone");
+  $("btn-file").addEventListener("click", () => $("file-input").click());
+  $("file-input").addEventListener("change", (e) => {
+    if (e.target.files[0]) loadFile(e.target.files[0]);
+    e.target.value = "";
+  });
+  $("btn-demo").addEventListener("click", loadDemo);
+  dz.addEventListener("dragover", (e) => { e.preventDefault(); dz.classList.add("dragover"); });
+  dz.addEventListener("dragleave", () => dz.classList.remove("dragover"));
+  dz.addEventListener("drop", (e) => {
+    e.preventDefault();
+    dz.classList.remove("dragover");
+    if (e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]);
+  });
+  // ページ全体へのドロップでブラウザがファイルを開いてしまうのを防ぐ
+  document.addEventListener("dragover", (e) => e.preventDefault());
+  document.addEventListener("drop", (e) => e.preventDefault());
+
+  // エディタ
+  $("btn-eject").addEventListener("click", ejectFile);
+  $("btn-play").addEventListener("click", togglePlayback);
+  $("btn-bypass").addEventListener("click", toggleBypass);
+  $("wave").addEventListener("click", (e) => {
+    const rect = $("wave").getBoundingClientRect();
+    seekTo((e.clientX - rect.left) / rect.width);
+  });
+  $("tab-a").addEventListener("click", () => switchTab("a"));
+  $("tab-b").addEventListener("click", () => switchTab("b"));
+  $("btn-save-preset").addEventListener("click", saveUserPreset);
+
+  // モードB
+  $("btn-analyze").addEventListener("click", analyzeCurrentBuffer);
+  $("btn-chip-play").addEventListener("click", toggleChipPlayback);
+
+  // 書き出し
+  $("btn-export").addEventListener("click", openExportDialog);
+  $("btn-export-cancel").addEventListener("click", () => exportDialog.close());
+  $("btn-export-run").addEventListener("click", runExport);
+
+  // キーボード（Space=再生/停止、1〜5=プリセット、Esc=dialogが標準処理）
+  document.addEventListener("keydown", (e) => {
+    if (exportDialog.open) return;
+    const tag = e.target.tagName;
+    if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA" || tag === "BUTTON") {
+      if (e.code !== "Space") return; // ボタンフォーカス中でもSpaceは再生に割当
+    }
+    if (e.code === "Space") {
+      e.preventDefault();
+      if (screenEditor.classList.contains("hidden")) return;
+      if (app.activeTab === "b" && app.notes && app.notes.length > 0) toggleChipPlayback();
+      else togglePlayback();
+    } else if (/^Digit[1-5]$/.test(e.code) && !screenEditor.classList.contains("hidden")) {
+      const idx = Number(e.code.slice(5)) - 1;
+      if (BUILTIN_PRESETS[idx]) applyPreset(BUILTIN_PRESETS[idx]);
+    }
+  });
+
+  window.addEventListener("resize", () => {
+    if (!screenEditor.classList.contains("hidden")) {
+      resizeCanvases();
+      drawWave();
+      if (app.activeTab === "b") drawPianoroll();
+    }
+  });
+}
+
+/* ===== 起動 ===== */
+
+app.activeTab = "a";
+loadSettings();
+renderPresetBar();
+applyParamsToControls();
+applyChipToControls();
+bindParamControls();
+bindChipControls();
+bindEvents();
+rafLoop();
+</script>
+</body>
+</html>
