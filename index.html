@@ -766,6 +766,59 @@ function harmonicSalience(mag, fftSize, rate, freq, nHarm, decay) {
   return s;
 }
 
+// ---- HPSS: 調波/打楽器音分離（メディアンフィルタ方式） ----
+// 楽音は「時間方向に持続」、打撃は「周波数方向に広がる」性質を使い、
+// スペクトログラムを H（調波）と P（打撃）に分ける。
+// メロディ検出はHから・ドラム検出はPから行うことで相互汚染を防ぐ
+
+function medianOfWindow(values, scratch) {
+  const n = values.length;
+  for (let i = 0; i < n; i++) scratch[i] = values[i];
+  // 少数要素なので挿入ソートで十分
+  for (let i = 1; i < n; i++) {
+    const v = scratch[i];
+    let j = i - 1;
+    while (j >= 0 && scratch[j] > v) { scratch[j + 1] = scratch[j]; j--; }
+    scratch[j + 1] = v;
+  }
+  return scratch[n >> 1];
+}
+
+// 1フレーム分のHPSS。mags: スペクトログラム全体、t: 対象フレーム
+// 戻り値: { harm, perc }（いずれも Float32Array）
+function hpssFrame(mags, t, timeHalf, freqHalf) {
+  const bins = mags[t].length;
+  const harm = new Float32Array(bins);
+  const perc = new Float32Array(bins);
+  const timeWin = [];
+  const scratchT = new Float32Array(timeHalf * 2 + 1);
+  const scratchF = new Float32Array(freqHalf * 2 + 1);
+  const freqWin = [];
+  for (let b = 0; b < bins; b++) {
+    // 時間方向メディアン（調波の持続性）
+    timeWin.length = 0;
+    for (let dt = -timeHalf; dt <= timeHalf; dt++) {
+      const tt = t + dt;
+      if (tt >= 0 && tt < mags.length) timeWin.push(mags[tt][b]);
+    }
+    const tm = medianOfWindow(timeWin, scratchT);
+    // 周波数方向メディアン（打撃の広帯域性）
+    freqWin.length = 0;
+    for (let db = -freqHalf; db <= freqHalf; db++) {
+      const bb = b + db;
+      if (bb >= 0 && bb < bins) freqWin.push(mags[t][bb]);
+    }
+    const fm = medianOfWindow(freqWin, scratchF);
+    // Wienerソフトマスク
+    const tm2 = tm * tm, fm2 = fm * fm;
+    const denom = tm2 + fm2;
+    const h = denom > 0 ? mags[t][b] * (tm2 / denom) : 0;
+    harm[b] = h;
+    perc[b] = mags[t][b] - h;
+  }
+  return { harm, perc };
+}
+
 function midiGridRange(lo, hi, step) {
   const grid = [];
   for (let m = lo; m <= hi + 1e-9; m += step) grid.push(m);
@@ -847,6 +900,7 @@ function detectOnsets(features, hopTime, opts) {
     kickLowRatio: 0.35,  // 低域フラックス比がこれ以上ならキック
     hatCentroidHz: 5500, // 重心がこれ以上ならハイハット
     minSpread: 0.22,     // 拡散度がこれ未満（＝音程楽器のアタック）は原則除外
+    minPercRatio: 0.4,   // 打撃比がこれ未満（＝楽音の立ち上がり優勢）も原則除外
   }, opts);
   const n = features.length;
   if (n === 0) return [];
@@ -869,8 +923,11 @@ function detectOnsets(features, hopTime, opts) {
     const t = i * hopTime;
     if (!isPeak || flux[i] < threshold || t - lastT < o.refractorySec) continue;
     const f = features[i];
-    // 音程楽器のアタック除け: 帯域拡散が低い立ち上がりは、よほど強くない限り打撃としない
-    if (f.spread !== undefined && f.spread < o.minSpread && flux[i] < 3 * threshold) continue;
+    // 音程楽器のアタック除け: 帯域拡散が低い、または打撃比が低い立ち上がりは、
+    // よほど強くない限り打撃としない
+    const weakHit = flux[i] < 3 * threshold;
+    if (f.spread !== undefined && f.spread < o.minSpread && weakHit) continue;
+    if (f.percRatio !== undefined && f.percRatio < o.minPercRatio && weakHit) continue;
     lastT = t;
     let type = "snare";
     if (f.flux > 0 && f.lowFlux / f.flux >= o.kickLowRatio) type = "kick";
@@ -1073,6 +1130,8 @@ function* analyzePolyphonicSteps(data, rate, opts) {
     lambdaPerSemi: 0.25, jumpCap: 1.2,
     harmonyMaskSemi: 0.75,           // ハモリ抽出時にメロディ近傍を消す幅
     lowFluxHz: 250,                  // ドラム特徴: 低域フラックスの上限
+    binLimitHz: 8000,                // スペクトログラム保持上限（メモリ節約）
+    hpssHalfTime: 6, hpssHalfFreq: 6, // HPSSメディアン窓の片幅（約±60ms / ±65Hz）
     yieldEvery: 50,
   }, opts);
   const hop = Math.max(1, Math.round(rate * o.hopSec));
@@ -1082,11 +1141,34 @@ function* analyzePolyphonicSteps(data, rate, opts) {
   const win = hannWindow(o.frameSize);
   const lowFluxBin = Math.ceil((o.lowFluxHz * o.frameSize) / rate);
 
-  const melRows = [], bassRows = [], fundRows = [], features = [];
-  let prevMag = null;
+  const binLimit = Math.min(o.frameSize >> 1, Math.ceil((o.binLimitHz * o.frameSize) / rate));
+  const totalUnits = total * 3; // パス1: STFT / パス2: HPSS / パス3: サリエンス＋特徴
+
+  // パス1: スペクトログラムを貯める
+  let mags = [];
   for (let f = 0; f < total; f++) {
     const seg = data.subarray(f * hop, f * hop + o.frameSize);
     const mag = fftMagnitude(seg, o.frameSize, win);
+    mags.push(mag.slice(0, binLimit));
+    if (f % o.yieldEvery === 0) yield { done: f, total: totalUnits };
+  }
+
+  // パス2: HPSSで調波成分（楽音）と打撃成分に分離
+  // バンドインするとドラムの広帯域エネルギーがサリエンスを汚し、
+  // メロディ追跡が一気に崩れるため（単音区間では起きない）
+  const harmMags = [], percMags = [];
+  for (let f = 0; f < total; f++) {
+    const { harm, perc } = hpssFrame(mags, f, o.hpssHalfTime, o.hpssHalfFreq);
+    harmMags.push(harm);
+    percMags.push(perc);
+    if (f % o.yieldEvery === 0) yield { done: total + f, total: totalUnits };
+  }
+  mags = null; // 生スペクトログラムは以降不要（メモリ解放）
+
+  // パス3: 調波成分からピッチサリエンス、打撃成分からドラム特徴
+  const melRows = [], bassRows = [], fundRows = [], features = [];
+  for (let f = 0; f < total; f++) {
+    const mag = harmMags[f];
     melRows.push(buildSalienceRow(mag, o.frameSize, rate, melGrid, o.melodyHarm, o.melodyDecay));
     bassRows.push(buildSalienceRow(mag, o.frameSize, rate, bassGrid, o.bassHarm, o.bassDecay));
     // 各候補ピッチの「基音そのもの」の強さ（ハモリのゴースト判定用）
@@ -1095,35 +1177,41 @@ function* analyzePolyphonicSteps(data, rate, opts) {
       fundRow[s] = interpMag(mag, (midiToFreq(melGrid[s]) * o.frameSize) / rate);
     }
     fundRows.push(fundRow);
-    // ドラム特徴: 正のスペクトルフラックス（増加分のみ）＋低域比＋増加分の重心
-    // ＋拡散度（増加したビンの割合。打楽器は帯域全体に広がり、音程楽器は倍音に集中する）
-    let flux = 0, lowFlux = 0, centWeighted = 0, risingBins = 0;
-    if (prevMag) {
-      for (let b = 1; b < mag.length; b++) {
-        const d = mag[b] - prevMag[b];
+    // ドラム特徴: 打撃成分の正のフラックス＋低域比＋重心＋拡散度＋打撃比
+    const perc = percMags[f];
+    const prevPerc = f > 0 ? percMags[f - 1] : null;
+    const prevHarm = f > 0 ? harmMags[f - 1] : null;
+    let flux = 0, lowFlux = 0, centWeighted = 0, risingBins = 0, harmFlux = 0;
+    if (prevPerc) {
+      for (let b = 1; b < perc.length; b++) {
+        const d = perc[b] - prevPerc[b];
         if (d > 0) {
           flux += d;
           if (b <= lowFluxBin) lowFlux += d;
           centWeighted += d * ((b * rate) / o.frameSize);
         }
+        const dh = mag[b] - prevHarm[b];
+        if (dh > 0) harmFlux += dh;
       }
       // 平均的な増加量の1/4を超えて増えたビンの割合（フレーム内相対なので音量非依存）
-      const riseThreshold = flux / (mag.length * 4);
+      const riseThreshold = flux / (perc.length * 4);
       if (flux > 0) {
-        for (let b = 1; b < mag.length; b++) {
-          if (mag[b] - prevMag[b] > riseThreshold) risingBins++;
+        for (let b = 1; b < perc.length; b++) {
+          if (perc[b] - prevPerc[b] > riseThreshold) risingBins++;
         }
       }
     }
     features.push({
       flux, lowFlux,
       centroid: flux > 0 ? centWeighted / flux : 0,
-      spread: risingBins / (o.frameSize >> 1),
+      spread: risingBins / perc.length,
+      // 立ち上がり全体のうち打撃成分の割合。楽音のアタック（調波の立ち上がり）と
+      // 本物の打撃を区別する
+      percRatio: flux + harmFlux > 0 ? flux / (flux + harmFlux) : 0,
     });
-    prevMag = mag;
-    if (f % o.yieldEvery === 0) yield { done: f, total };
+    if (f % o.yieldEvery === 0) yield { done: total * 2 + f, total: totalUnits };
   }
-  yield { done: total, total };
+  yield { done: totalUnits, total: totalUnits };
 
   const hopTime = hop / rate;
   // メロディ: 最も目立つ旋律線。ゲートを緩めて取りこぼしを減らす
@@ -1310,6 +1398,7 @@ const PURE = {
   mixToMono, downsampleTo, frameRms, yinPitch, freqToMidi, midiToFreq,
   medianFilterNullable, medianOf, circularMeanFraction, framesToNotes,
   fftRadix2, hannWindow, fftMagnitude, interpMag, harmonicSalience,
+  medianOfWindow, hpssFrame,
   midiGridRange, buildSalienceRow, viterbiPitchTrack, trackToFrames,
   detectOnsets, renderDrums, analyzePolyphonicSteps,
   estimateTempo, quantizeNotes, quantizeDrums, legatoNotes, fixOctaveOutliers,
