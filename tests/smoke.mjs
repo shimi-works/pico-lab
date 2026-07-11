@@ -18,6 +18,9 @@ const inject = `<script>
 window.addEventListener("load", async () => {
   const out = [];
   const step = (s) => { document.title = "SMOKE-AT:" + s + " | " + out.join(" "); };
+  // 仮想時間は保留タイマーが無いと一気に進んでバジェットを使い切る。
+  // タイマーを常駐させて、タイマーを伴わないPromise（startRendering等）の解決を待てるようにする
+  const heartbeat = setInterval(() => {}, 100);
   try {
     step("start");
     const rate = 44100;
@@ -68,8 +71,10 @@ window.addEventListener("load", async () => {
     const rendered = await off3.startRendering();
     const wav = encodeWavPcm16([rendered.getChannelData(0)], 22050);
     out.push("wav=" + wav.byteLength + "B");
+    clearInterval(heartbeat);
     document.title = "SMOKE-OK " + out.join(" ");
   } catch (e) {
+    clearInterval(heartbeat);
     document.title = "SMOKE-ERR:" + (e && e.message) + " | " + out.join(" ");
   }
 });
@@ -120,11 +125,9 @@ try {
 server.close();
 console.log("http:// :", httpTitle);
 
-// 既知の制約: ヘッドレス＋file:// では OfflineAudioContext.startRendering が解決せず、
-// 仮想時間バジェットの競合で解析以降の到達点も揺れる（同一コードが http:// では
-// 完走するためアプリ側の問題ではない）。file:// の合格条件は
-// 「Workletフォールバック成功＋デモ生成＋エディタ遷移」までとし、
-// 解析〜書き出しの完走確認は http:// 側で行う。
+// ハートビートタイマー導入後は file:// でも全経路（WAV書き出しまで）完走する。
+// 万一仮想時間レースで途中ダンプした場合のみ、
+// 「Workletフォールバック成功＋デモ生成＋エディタ遷移」までを最低合格条件とする
 const fileOk = fileTitle.startsWith("SMOKE-OK") ||
   (/worklet=(blob|data)/.test(fileTitle) && fileTitle.includes("demo=") && fileTitle.includes("editor=true"));
 const httpOk = httpTitle.startsWith("SMOKE-OK") && httpTitle.includes("worklet=blob");

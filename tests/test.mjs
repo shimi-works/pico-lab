@@ -278,6 +278,157 @@ test("framesToNotes: 同音連打は音量の再アタックで分割される",
   assert.equal(notes[1].midi, 69);
 });
 
+// ---- 多声解析（FFT・サリエンス・Viterbi・ドラム） ----
+
+test("fftMagnitude: サイン波のピークが正しいビンに立つ", () => {
+  const n = 128;
+  const sig = Float32Array.from({ length: n }, (_, i) => Math.sin((2 * Math.PI * 8 * i) / n));
+  const mag = P.fftMagnitude(sig, n, null);
+  let argmax = 0;
+  for (let i = 1; i < mag.length; i++) if (mag[i] > mag[argmax]) argmax = i;
+  assert.equal(argmax, 8);
+});
+
+test("harmonicSalience: 倍音を持つ音の基本周波数が最大サリエンスになる", () => {
+  const rate = 22050, fftSize = 2048;
+  const sig = new Float32Array(fftSize);
+  for (let i = 0; i < fftSize; i++) {
+    const t = i / rate;
+    for (let h = 1; h <= 5; h++) sig[i] += Math.pow(0.7, h - 1) * Math.sin(2 * Math.PI * 440 * h * t);
+  }
+  const mag = P.fftMagnitude(sig, fftSize, P.hannWindow(fftSize));
+  const grid = P.midiGridRange(57, 81, 0.5); // A3〜A5
+  const row = P.buildSalienceRow(mag, fftSize, rate, grid, 8, 0.8);
+  let argmax = 0;
+  for (let s = 1; s < row.length; s++) if (row[s] > row[argmax]) argmax = s;
+  approx(grid[argmax], 69, 0.5, "A4=440Hzが最大");
+});
+
+test("viterbiPitchTrack: 遠い単発ノイズに引きずられず、本当の遷移には追従する", () => {
+  const S = 30;
+  const mkRow = (strong) => {
+    const r = new Float32Array(S).fill(0.1);
+    r[strong] = 1;
+    return r;
+  };
+  // フレーム5だけ遠い偽ピーク（state29）。往復jumpCap×2 > 発話利得なので無視される
+  const rows = [];
+  for (let t = 0; t < 5; t++) rows.push(mkRow(0));
+  rows.push(mkRow(S - 1));
+  for (let t = 6; t < 10; t++) rows.push(mkRow(0));
+  const path1 = P.viterbiPitchTrack(rows, 0.5, 0.25, 1.2);
+  assert.equal(path1[5], 0, "単発の遠いノイズを無視");
+  // 本当の遷移（持続する）には追従する
+  const rows2 = [];
+  for (let t = 0; t < 5; t++) rows2.push(mkRow(0));
+  for (let t = 5; t < 10; t++) rows2.push(mkRow(S - 1));
+  const path2 = P.viterbiPitchTrack(rows2, 0.5, 0.25, 1.2);
+  assert.equal(path2[2], 0, "前半は0");
+  assert.equal(path2[8], S - 1, "後半は遷移に追従");
+});
+
+test("detectOnsets: 打撃を検出し種類を分類する", () => {
+  const features = [];
+  for (let i = 0; i < 120; i++) features.push({ flux: 0.1, lowFlux: 0.01, centroid: 2000 });
+  features[20] = { flux: 2.0, lowFlux: 1.0, centroid: 800 };   // 低域優勢 → キック
+  features[50] = { flux: 2.0, lowFlux: 0.05, centroid: 7500 }; // 高重心 → ハイハット
+  features[80] = { flux: 2.0, lowFlux: 0.1, centroid: 3000 };  // それ以外 → スネア
+  const hits = P.detectOnsets(features, 0.01, {});
+  assert.equal(hits.length, 3, JSON.stringify(hits));
+  assert.equal(hits[0].type, "kick");
+  assert.equal(hits[1].type, "hat");
+  assert.equal(hits[2].type, "snare");
+  approx(hits[0].t, 0.2, 1e-9, "キック位置");
+});
+
+test("renderDrums: ノイズ打撃が生成され、最後の打撃後は無音", () => {
+  const sr = 22050;
+  const out = P.renderDrums([
+    { t: 0.0, type: "kick", strength: 1 },
+    { t: 0.2, type: "snare", strength: 0.8 },
+    { t: 0.4, type: "hat", strength: 0.5 },
+  ], sr);
+  let peak = 0, tail = 0;
+  for (let i = 0; i < out.length; i++) {
+    assert.ok(Number.isFinite(out[i]));
+    const a = Math.abs(out[i]);
+    if (a > peak) peak = a;
+    if (i > 0.52 * sr && a > tail) tail = a;
+  }
+  assert.ok(peak > 0.1 && peak <= 0.951, `peak=${peak}`);
+  assert.ok(tail < 0.01, `tail=${tail}`);
+});
+
+test("mixFloat32: ゲイン付きミックスとクリップ防止", () => {
+  const out = P.mixFloat32([Float32Array.from([1, 0]), Float32Array.from([0, 1])], [0.5, 0.5]);
+  approx(out[0], 0.5, 1e-7, "mix");
+  const clipped = P.mixFloat32([Float32Array.from([1]), Float32Array.from([1])], [1, 1]);
+  approx(clipped[0], 0.95, 1e-6, "正規化");
+});
+
+test("統合: 多声解析でメロディとベースを同時に抽出できる", () => {
+  const rate = 22050;
+  const melodyNotes = [
+    { start: 0.0, dur: 0.35, midi: 76, vel: 1 },
+    { start: 0.4, dur: 0.35, midi: 79, vel: 1 },
+    { start: 0.8, dur: 0.35, midi: 83, vel: 1 },
+  ];
+  const bassNotes = [{ start: 0.0, dur: 1.15, midi: 45, vel: 1 }];
+  const audio = P.renderChipTracks([
+    { notes: melodyNotes, settings: { wave: "square50", vibrato: 0, decay: 0 }, gain: 0.7 },
+    { notes: bassNotes, settings: { wave: "triangle", vibrato: 0, decay: 0 }, gain: 0.6 },
+  ], rate);
+
+  const it = P.analyzePolyphonicSteps(audio, rate, {});
+  let step = it.next();
+  while (!step.done) step = it.next();
+  const result = step.value;
+
+  const melMidis = result.melody.map((n) => n.midi);
+  for (const m of [76, 79, 83]) {
+    assert.ok(melMidis.includes(m), `メロディ ${m}（実際: ${melMidis.join(",")}）`);
+  }
+  const bassMidis = result.bass.map((n) => n.midi);
+  assert.ok(bassMidis.includes(45), `ベース 45（実際: ${bassMidis.join(",")}）`);
+});
+
+test("統合: 本物のハモリは検出され、メロディだけの音源ではハモリが出ない", () => {
+  const rate = 22050;
+  const melodyNotes = [
+    { start: 0.0, dur: 0.35, midi: 76, vel: 1 },
+    { start: 0.4, dur: 0.35, midi: 79, vel: 1 },
+    { start: 0.8, dur: 0.35, midi: 83, vel: 1 },
+  ];
+  const drain = (audio) => {
+    const it = P.analyzePolyphonicSteps(audio, rate, {});
+    let step = it.next();
+    while (!step.done) step = it.next();
+    return step.value;
+  };
+  // メロディのみ → ハモリ（倍音ゴースト）はゼロであること
+  const solo = P.renderChipTracks([
+    { notes: melodyNotes, settings: { wave: "square50", vibrato: 0, decay: 0 }, gain: 0.7 },
+  ], rate);
+  const soloResult = drain(solo);
+  assert.equal(soloResult.harmony.length, 0,
+    `ゴーストハモリ: ${JSON.stringify(soloResult.harmony)}`);
+  // メロディ＋3度下のハモリ → ハモリトラックに検出されること
+  const harmonyNotes = [
+    { start: 0.0, dur: 0.35, midi: 72, vel: 1 },
+    { start: 0.4, dur: 0.35, midi: 75, vel: 1 },
+    { start: 0.8, dur: 0.35, midi: 80, vel: 1 },
+  ];
+  const duet = P.renderChipTracks([
+    { notes: melodyNotes, settings: { wave: "square50", vibrato: 0, decay: 0 }, gain: 0.7 },
+    { notes: harmonyNotes, settings: { wave: "square50", vibrato: 0, decay: 0 }, gain: 0.5 },
+  ], rate);
+  const duetResult = drain(duet);
+  const harmMidis = duetResult.harmony.map((n) => n.midi);
+  const found = [72, 75, 80].filter((m) => harmMidis.includes(m));
+  assert.ok(found.length >= 2,
+    `ハモリ検出 2/3 以上（実際: ${harmMidis.join(",")}）`);
+});
+
 // ---- チップシンセ ----
 
 test("renderChip: 長さ・振幅・無音区間が正しい", () => {

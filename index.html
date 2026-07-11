@@ -281,18 +281,31 @@ footer a { color: var(--dim); }
     <!-- モードB -->
     <div class="tab-body" id="panel-b">
       <p class="note">
-        歌・口笛・単音楽器の録音からメロディを検出し、ファミコンのチップ音源で鳴らし直します。
-        <strong>単音の音源向け</strong>（ミックス済みの市販曲では正しく検出できません）。解析は先頭120秒まで。
+        音源からメロディ（＋ベース）を検出し、ファミコンのチップ音源で鳴らし直します。解析は先頭120秒まで。
       </p>
+      <div class="param-row">
+        <label for="b-mode">音源タイプ</label>
+        <select id="b-mode">
+          <option value="poly">曲・伴奏入り（メロディ＋ベースを抽出）</option>
+          <option value="mono">単音の録音（歌・口笛・単音楽器）</option>
+        </select>
+        <span></span>
+      </div>
       <div class="row-actions">
         <button id="btn-analyze" class="primary">この音源を解析する</button>
         <span class="note" id="analyze-status"></span>
       </div>
       <div class="progress-wrap hidden" id="progress-wrap"><div id="analyze-progress"></div></div>
       <canvas id="pianoroll" class="hidden"></canvas>
+      <div class="row-actions hidden" id="track-toggles">
+        <label><input type="checkbox" id="t-melody" checked> <span style="color:#6ee787">■</span> メロディ（矩形波50%）</label>
+        <label><input type="checkbox" id="t-harmony" checked> <span style="color:#58a6ff">■</span> ハモリ（矩形波25%）</label>
+        <label><input type="checkbox" id="t-bass" checked> <span style="color:#ffb454">■</span> ベース（三角波）</label>
+        <label><input type="checkbox" id="t-drums" checked> <span style="color:#8791b3">■</span> ドラム（ノイズ）</label>
+      </div>
       <div id="chip-controls" class="hidden">
         <div class="param-row">
-          <label for="c-wave">波形</label>
+          <label for="c-wave">メロディ波形</label>
           <select id="c-wave">
             <option value="square50">ファミコン矩形波 50%（メロディの定番）</option>
             <option value="square25">ファミコン矩形波 25%（細め・軽快）</option>
@@ -584,6 +597,7 @@ function framesToNotes(frames, hopTime, opts) {
     minDur: 0.06,        // これ未満のノートは破棄
     minClarity: 0.5,     // YIN信頼度ゲート
     midiLow: 24, midiHigh: 96,
+    tuneComp: true,      // グローバルチューニング補正の有無
     splitSemi: 0.7,      // 隣接フレームのピッチ跳躍がこれを超えたら別ノート
     maxGapFrames: 3,     // 無声フレームがこの数まで続いても同一ノート扱い
     mergeGapSec: 0.08,   // 同音ノートの間隙がこれ以下なら結合（音量の揺れ対策）
@@ -591,10 +605,10 @@ function framesToNotes(frames, hopTime, opts) {
     reattackRise: 2.2,   // …この倍率で急回復したら同音連打として分割
   }, opts);
 
-  // 音量統計 → 有声ゲート
+  // 音量統計 → 有声ゲート（rmsGateRatioで感度調整可能）
   let maxRms = 0;
   for (const f of frames) if (f && f.rms > maxRms) maxRms = f.rms;
-  const rmsGate = Math.max(0.005, maxRms * 0.08);
+  const rmsGate = Math.max(0.005, maxRms * (o.rmsGateRatio || 0.08), o.rmsGateAbs || 0);
 
   // 有声フレーム → 連続midi値（丸めない）
   const midis = frames.map((f) => {
@@ -606,7 +620,8 @@ function framesToNotes(frames, hopTime, opts) {
 
   const voiced = smoothed.filter((v) => v !== null);
   if (voiced.length === 0) return [];
-  const tuningOffset = circularMeanFraction(voiced);
+  // 多声解析はピッチが半音グリッド上に量子化済みのため補正しない（tuneComp:false）
+  const tuningOffset = o.tuneComp === false ? 0 : circularMeanFraction(voiced);
 
   // 有声ラン抽出（maxGapFrames以下の無声ギャップは同一ランとして継続）
   const runs = [];
@@ -678,6 +693,362 @@ function framesToNotes(frames, hopTime, opts) {
   return notes;
 }
 
+// ---- 多声解析: FFT・倍音サリエンス・Viterbi（transcribe/poly） ----
+// ミックス音源（伴奏入りの曲）からメロディとベースを別トラックとして抽出する。
+// 方式: STFT → 候補ピッチごとの倍音和（サリエンス）→ Viterbiで滑らかな軌跡を選択
+
+function fftRadix2(re, im) {
+  const n = re.length;
+  // ビット反転並べ替え
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      let t = re[i]; re[i] = re[j]; re[j] = t;
+      t = im[i]; im[i] = im[j]; im[j] = t;
+    }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const half = len >> 1;
+    const ang = -2 * Math.PI / len;
+    const wRe = Math.cos(ang), wIm = Math.sin(ang);
+    for (let i = 0; i < n; i += len) {
+      let curRe = 1, curIm = 0;
+      for (let k = 0; k < half; k++) {
+        const aRe = re[i + k], aIm = im[i + k];
+        const bRe = re[i + k + half] * curRe - im[i + k + half] * curIm;
+        const bIm = re[i + k + half] * curIm + im[i + k + half] * curRe;
+        re[i + k] = aRe + bRe; im[i + k] = aIm + bIm;
+        re[i + k + half] = aRe - bRe; im[i + k + half] = aIm - bIm;
+        const nRe = curRe * wRe - curIm * wIm;
+        curIm = curRe * wIm + curIm * wRe;
+        curRe = nRe;
+      }
+    }
+  }
+}
+
+function hannWindow(n) {
+  const w = new Float32Array(n);
+  for (let i = 0; i < n; i++) w[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (n - 1));
+  return w;
+}
+
+// segment（長さ≦fftSize）に窓をかけてゼロ埋めFFT → 振幅スペクトル（fftSize/2ビン）
+function fftMagnitude(segment, fftSize, window) {
+  const re = new Float32Array(fftSize);
+  const im = new Float32Array(fftSize);
+  for (let i = 0; i < segment.length; i++) re[i] = window ? segment[i] * window[i] : segment[i];
+  fftRadix2(re, im);
+  const mag = new Float32Array(fftSize >> 1);
+  for (let i = 0; i < mag.length; i++) mag[i] = Math.sqrt(re[i] * re[i] + im[i] * im[i]);
+  return mag;
+}
+
+function interpMag(mag, binFloat) {
+  const i = Math.floor(binFloat);
+  if (i < 0 || i >= mag.length - 1) return 0;
+  const frac = binFloat - i;
+  return mag[i] * (1 - frac) + mag[i + 1] * frac;
+}
+
+// 候補ピッチ freq の倍音和サリエンス（重みは decay^(h-1)）
+function harmonicSalience(mag, fftSize, rate, freq, nHarm, decay) {
+  let s = 0, w = 1;
+  for (let h = 1; h <= nHarm; h++) {
+    const bin = (freq * h * fftSize) / rate;
+    if (bin >= mag.length - 1) break;
+    s += w * interpMag(mag, bin);
+    w *= decay;
+  }
+  return s;
+}
+
+function midiGridRange(lo, hi, step) {
+  const grid = [];
+  for (let m = lo; m <= hi + 1e-9; m += step) grid.push(m);
+  return grid;
+}
+
+function buildSalienceRow(mag, fftSize, rate, grid, nHarm, decay) {
+  const row = new Float32Array(grid.length);
+  for (let s = 0; s < grid.length; s++) {
+    row[s] = harmonicSalience(mag, fftSize, rate, midiToFreq(grid[s]), nHarm, decay);
+  }
+  return row;
+}
+
+// サリエンス行列からViterbiで滑らかなピッチ軌跡を選ぶ。
+// 遷移コスト=半音距離×lambda（jumpCapで頭打ち→フレーズ間の跳躍も許す）。
+// 距離変換の2パスで遷移最小化をO(状態数)に落としている
+function viterbiPitchTrack(rows, gridStepSemi, lambdaPerSemi, jumpCap) {
+  const T = rows.length;
+  if (T === 0) return new Int32Array(0);
+  const S = rows[0].length;
+  const stepCost = lambdaPerSemi * gridStepSemi;
+  const back = new Int32Array(T * S);
+  let dp = new Float32Array(S);
+  let ndp = new Float32Array(S);
+  const emit = (row, s, rowMax) => (rowMax > 0 ? 1 - row[s] / rowMax : 1);
+
+  let rowMax = 0;
+  for (let s = 0; s < S; s++) if (rows[0][s] > rowMax) rowMax = rows[0][s];
+  for (let s = 0; s < S; s++) dp[s] = emit(rows[0], s, rowMax);
+
+  const leftVal = new Float32Array(S), rightVal = new Float32Array(S);
+  const leftArg = new Int32Array(S), rightArg = new Int32Array(S);
+
+  for (let t = 1; t < T; t++) {
+    // 左右スイープ: min_{s'}(dp[s'] + stepCost*|s-s'|) と argmin
+    for (let s = 0; s < S; s++) {
+      if (s > 0 && leftVal[s - 1] + stepCost < dp[s]) {
+        leftVal[s] = leftVal[s - 1] + stepCost; leftArg[s] = leftArg[s - 1];
+      } else { leftVal[s] = dp[s]; leftArg[s] = s; }
+    }
+    for (let s = S - 1; s >= 0; s--) {
+      if (s < S - 1 && rightVal[s + 1] + stepCost < dp[s]) {
+        rightVal[s] = rightVal[s + 1] + stepCost; rightArg[s] = rightArg[s + 1];
+      } else { rightVal[s] = dp[s]; rightArg[s] = s; }
+    }
+    let gMin = Infinity, gArg = 0;
+    for (let s = 0; s < S; s++) if (dp[s] < gMin) { gMin = dp[s]; gArg = s; }
+
+    rowMax = 0;
+    for (let s = 0; s < S; s++) if (rows[t][s] > rowMax) rowMax = rows[t][s];
+    for (let s = 0; s < S; s++) {
+      let best = leftVal[s], arg = leftArg[s];
+      if (rightVal[s] < best) { best = rightVal[s]; arg = rightArg[s]; }
+      if (gMin + jumpCap < best) { best = gMin + jumpCap; arg = gArg; }
+      ndp[s] = emit(rows[t], s, rowMax) + best;
+      back[t * S + s] = arg;
+    }
+    const tmp = dp; dp = ndp; ndp = tmp;
+  }
+
+  const path = new Int32Array(T);
+  let end = 0;
+  for (let s = 1; s < S; s++) if (dp[s] < dp[end]) end = s;
+  path[T - 1] = end;
+  for (let t = T - 1; t > 0; t--) path[t - 1] = back[t * S + path[t]];
+  return path;
+}
+
+// ---- ドラム抽出: オンセット検出とノイズチャンネル合成 ----
+
+// スペクトルフラックス特徴列 [{flux, lowFlux, centroid}] → 打撃イベント列
+// [{t, type: "kick"|"snare"|"hat", strength}]
+function detectOnsets(features, hopTime, opts) {
+  const o = Object.assign({
+    windowSec: 0.5,      // 適応しきい値をとる近傍幅
+    ratio: 1.6,          // 近傍平均の何倍で打撃とみなすか
+    refractorySec: 0.07, // 連続検出の不応期
+    kickLowRatio: 0.35,  // 低域フラックス比がこれ以上ならキック
+    hatCentroidHz: 5500, // 重心がこれ以上ならハイハット
+  }, opts);
+  const n = features.length;
+  if (n === 0) return [];
+  const flux = features.map((f) => f.flux);
+  // 累積和で近傍平均をO(1)参照
+  const cum = new Float64Array(n + 1);
+  for (let i = 0; i < n; i++) cum[i + 1] = cum[i] + flux[i];
+  const half = Math.max(1, Math.round(o.windowSec / hopTime / 2));
+  let globalMax = 0;
+  for (const v of flux) if (v > globalMax) globalMax = v;
+  if (globalMax <= 0) return [];
+
+  const hits = [];
+  let lastT = -Infinity;
+  for (let i = 1; i < n - 1; i++) {
+    const lo = Math.max(0, i - half), hi = Math.min(n, i + half + 1);
+    const localMean = (cum[hi] - cum[lo]) / (hi - lo);
+    const threshold = o.ratio * localMean + 0.02 * globalMax;
+    const isPeak = flux[i] > flux[i - 1] && flux[i] >= flux[i + 1];
+    const t = i * hopTime;
+    if (!isPeak || flux[i] < threshold || t - lastT < o.refractorySec) continue;
+    lastT = t;
+    const f = features[i];
+    let type = "snare";
+    if (f.flux > 0 && f.lowFlux / f.flux >= o.kickLowRatio) type = "kick";
+    else if (f.centroid >= o.hatCentroidHz) type = "hat";
+    hits.push({ t, type, strength: Math.min(1, flux[i] / globalMax) });
+  }
+  return hits;
+}
+
+// ファミコンのノイズチャンネル風（15bit LFSR）でドラムを合成
+function renderDrums(hits, sampleRate) {
+  let total = 0.5;
+  for (const h of hits) total = Math.max(total, h.t + 0.15);
+  const out = new Float32Array(Math.ceil(total * sampleRate));
+  const TYPE_PARAMS = {
+    kick:  { dur: 0.08, step: Math.max(1, Math.round(sampleRate / 500)),  decay: 0.045, gain: 1.0 },
+    snare: { dur: 0.10, step: Math.max(1, Math.round(sampleRate / 8000)), decay: 0.040, gain: 0.8 },
+    hat:   { dur: 0.035, step: 1, decay: 0.012, gain: 0.5 },
+  };
+  for (const hit of hits) {
+    const p = TYPE_PARAMS[hit.type] || TYPE_PARAMS.snare;
+    const startIdx = Math.floor(hit.t * sampleRate);
+    const n = Math.floor(p.dur * sampleRate);
+    let reg = 0x4001; // 打撃ごとに同じシード（決定的・テスト可能）
+    let val = 1;
+    for (let i = 0; i < n; i++) {
+      const idx = startIdx + i;
+      if (idx >= out.length) break;
+      if (i % p.step === 0) {
+        const bit = (reg ^ (reg >> 1)) & 1;
+        reg = (reg >> 1) | (bit << 14);
+        val = (reg & 1) ? 1 : -1;
+      }
+      const t = i / sampleRate;
+      out[idx] += val * Math.exp(-t / p.decay) * p.gain * (0.4 + 0.6 * hit.strength) * 0.5;
+    }
+  }
+  let peak = 0;
+  for (let i = 0; i < out.length; i++) { const a = Math.abs(out[i]); if (a > peak) peak = a; }
+  if (peak > 0.95) {
+    const g = 0.95 / peak;
+    for (let i = 0; i < out.length; i++) out[i] *= g;
+  }
+  return out;
+}
+
+// Viterbi軌跡 → framesToNotes用のフレーム列。
+// clarity=そのフレーム内でのピッチの支配度、rms=サリエンスの相対強度（無音ゲート用）。
+// normMax指定時はそのスケールで正規化する（ハモリをメロディ基準で測るため）
+function trackToFrames(rows, path, grid, normMax) {
+  let globalMax = normMax || 0;
+  if (!normMax) {
+    for (let t = 0; t < rows.length; t++) {
+      const v = rows[t][path[t]];
+      if (v > globalMax) globalMax = v;
+    }
+  }
+  const frames = [];
+  for (let t = 0; t < rows.length; t++) {
+    const row = rows[t];
+    let rowMax = 0;
+    for (let s = 0; s < row.length; s++) if (row[s] > rowMax) rowMax = row[s];
+    const v = row[path[t]];
+    frames.push({
+      freq: midiToFreq(grid[path[t]]),
+      clarity: rowMax > 0 ? v / rowMax : 0,
+      rms: globalMax > 0 ? v / globalMax : 0,
+    });
+  }
+  return frames;
+}
+
+// 多声解析の全パイプライン（ジェネレータ）。yieldで進捗を返し、returnで結果を返す。
+// ブラウザはyieldごとにイベントループへ制御を返して進捗バーを更新し、
+// Nodeテストはそのままドレインする（純関数のままUIを固めないための形）。
+// 出力は4トラック: melody(矩形波50%)・harmony(同25%)・bass(三角波)・drums(ノイズ)
+function* analyzePolyphonicSteps(data, rate, opts) {
+  const o = Object.assign({
+    frameSize: 2048, hopSec: 0.01,
+    melodyLow: 48, melodyHigh: 89,   // C3〜F6
+    bassLow: 26, bassHigh: 49,       // D1〜C#3
+    gridStep: 0.5,
+    melodyHarm: 8, melodyDecay: 0.8,
+    bassHarm: 4, bassDecay: 0.9,
+    lambdaPerSemi: 0.25, jumpCap: 1.2,
+    harmonyMaskSemi: 0.75,           // ハモリ抽出時にメロディ近傍を消す幅
+    lowFluxHz: 250,                  // ドラム特徴: 低域フラックスの上限
+    yieldEvery: 50,
+  }, opts);
+  const hop = Math.max(1, Math.round(rate * o.hopSec));
+  const total = Math.max(0, Math.floor((data.length - o.frameSize) / hop));
+  const melGrid = midiGridRange(o.melodyLow, o.melodyHigh, o.gridStep);
+  const bassGrid = midiGridRange(o.bassLow, o.bassHigh, o.gridStep);
+  const win = hannWindow(o.frameSize);
+  const lowFluxBin = Math.ceil((o.lowFluxHz * o.frameSize) / rate);
+
+  const melRows = [], bassRows = [], fundRows = [], features = [];
+  let prevMag = null;
+  for (let f = 0; f < total; f++) {
+    const seg = data.subarray(f * hop, f * hop + o.frameSize);
+    const mag = fftMagnitude(seg, o.frameSize, win);
+    melRows.push(buildSalienceRow(mag, o.frameSize, rate, melGrid, o.melodyHarm, o.melodyDecay));
+    bassRows.push(buildSalienceRow(mag, o.frameSize, rate, bassGrid, o.bassHarm, o.bassDecay));
+    // 各候補ピッチの「基音そのもの」の強さ（ハモリのゴースト判定用）
+    const fundRow = new Float32Array(melGrid.length);
+    for (let s = 0; s < melGrid.length; s++) {
+      fundRow[s] = interpMag(mag, (midiToFreq(melGrid[s]) * o.frameSize) / rate);
+    }
+    fundRows.push(fundRow);
+    // ドラム特徴: 正のスペクトルフラックス（増加分のみ）＋低域比＋増加分の重心
+    let flux = 0, lowFlux = 0, centWeighted = 0;
+    if (prevMag) {
+      for (let b = 1; b < mag.length; b++) {
+        const d = mag[b] - prevMag[b];
+        if (d > 0) {
+          flux += d;
+          if (b <= lowFluxBin) lowFlux += d;
+          centWeighted += d * ((b * rate) / o.frameSize);
+        }
+      }
+    }
+    features.push({ flux, lowFlux, centroid: flux > 0 ? centWeighted / flux : 0 });
+    prevMag = mag;
+    if (f % o.yieldEvery === 0) yield { done: f, total };
+  }
+  yield { done: total, total };
+
+  const hopTime = hop / rate;
+  // メロディ: 最も目立つ旋律線。ゲートを緩めて取りこぼしを減らす
+  const melPath = viterbiPitchTrack(melRows, o.gridStep, o.lambdaPerSemi, o.jumpCap);
+  const melody = framesToNotes(trackToFrames(melRows, melPath, melGrid), hopTime, {
+    minDur: 0.05, minClarity: 0.45, rmsGateRatio: 0.05, maxGapFrames: 4, tuneComp: false,
+  });
+  // ハモリ: メロディ近傍をマスクした上での第2旋律線（同時発音・拾い漏れの回収）。
+  // メロディの全倍音位置（±1オクターブ下含む）をマスクして「倍音の偽ハモリ」を防ぐ
+  const maskSteps = Math.round(o.harmonyMaskSemi / o.gridStep);
+  const harmonicOffsets = [-12, 0];
+  for (let h = 2; h <= o.melodyHarm; h++) harmonicOffsets.push(12 * Math.log2(h));
+  // サリエンス×基音強度: 「倍音構造はあるが基音が無い」ゴースト候補を消す
+  const harmRows = melRows.map((row, t) => {
+    const r = new Float32Array(row.length);
+    const fund = fundRows[t];
+    for (let s = 0; s < row.length; s++) r[s] = row[s] * fund[s];
+    for (const off of harmonicOffsets) {
+      const c = melPath[t] + Math.round(off / o.gridStep);
+      for (let s = Math.max(0, c - maskSteps); s <= Math.min(r.length - 1, c + maskSteps); s++) r[s] = 0;
+    }
+    return r;
+  });
+  // ハモリの音量ゲートは「メロディの積スケール（サリエンス×基音強度）」で測る。
+  // サリエンス値で測ると、基音のないゴーストでも倍音の重なりだけで通過してしまう
+  let melProdMax = 0;
+  for (let t = 0; t < melRows.length; t++) {
+    const v = melRows[t][melPath[t]] * fundRows[t][melPath[t]];
+    if (v > melProdMax) melProdMax = v;
+  }
+  const harmPath = viterbiPitchTrack(harmRows, o.gridStep, o.lambdaPerSemi, o.jumpCap);
+  const harmFrames = [];
+  for (let t = 0; t < harmRows.length; t++) {
+    const row = harmRows[t];
+    let rowMax = 0;
+    for (let s = 0; s < row.length; s++) if (row[s] > rowMax) rowMax = row[s];
+    const v = row[harmPath[t]];
+    harmFrames.push({
+      freq: midiToFreq(melGrid[harmPath[t]]),
+      clarity: rowMax > 0 ? v / rowMax : 0,
+      rms: melProdMax > 0 ? v / melProdMax : 0,
+    });
+  }
+  const harmony = framesToNotes(harmFrames, hopTime, {
+    minDur: 0.07, minClarity: 0.5, rmsGateAbs: 0.04, tuneComp: false,
+  });
+  // ベース: 低域の旋律線
+  const bassPath = viterbiPitchTrack(bassRows, o.gridStep, o.lambdaPerSemi, o.jumpCap);
+  const bass = framesToNotes(trackToFrames(bassRows, bassPath, bassGrid), hopTime, {
+    minDur: 0.09, mergeGapSec: 0.1, tuneComp: false, midiLow: 24, midiHigh: 52,
+  });
+  // ドラム: オンセット検出 → ノイズチャンネル
+  const drums = detectOnsets(features, hopTime, {});
+  return { melody, harmony, bass, drums };
+}
+
 // ---- チップシンセ（chipsynth） ----
 
 // notes: [{start, dur, midi, vel}] → モノラル Float32Array
@@ -732,6 +1103,31 @@ function renderChip(notes, settings, sampleRate) {
   return out;
 }
 
+// 複数のFloat32Arrayをゲイン付きでミックスし、クリップしないよう正規化
+function mixFloat32(buffers, gains) {
+  let n = 0;
+  for (const b of buffers) if (b.length > n) n = b.length;
+  const out = new Float32Array(n);
+  for (let k = 0; k < buffers.length; k++) {
+    const b = buffers[k], g = gains[k];
+    for (let i = 0; i < b.length; i++) out[i] += b[i] * g;
+  }
+  let peak = 0;
+  for (let i = 0; i < n; i++) { const a = Math.abs(out[i]); if (a > peak) peak = a; }
+  if (peak > 0.95) {
+    const g = 0.95 / peak;
+    for (let i = 0; i < n; i++) out[i] *= g;
+  }
+  return out;
+}
+
+// 複数トラック（メロディ=矩形波、ベース=三角波 等）をまとめてレンダリング
+// tracks: [{notes, settings, gain}]
+function renderChipTracks(tracks, sampleRate) {
+  const buffers = tracks.map((t) => renderChip(t.notes, t.settings, sampleRate));
+  return mixFloat32(buffers, tracks.map((t) => t.gain));
+}
+
 // ---- デモ音源（自作フレーズをその場で合成。音源ファイルは同梱しない） ----
 
 function buildDemoNotes() {
@@ -753,12 +1149,10 @@ function buildDemoNotes() {
 
 function renderDemoSong(sampleRate) {
   const { melody, bass } = buildDemoNotes();
-  const a = renderChip(melody, { wave: "square50", vibrato: 0.15, decay: 0.25 }, sampleRate);
-  const b = renderChip(bass, { wave: "triangle", vibrato: 0, decay: 0.1 }, sampleRate);
-  const n = Math.max(a.length, b.length);
-  const out = new Float32Array(n);
-  for (let i = 0; i < n; i++) out[i] = (i < a.length ? a[i] : 0) * 0.7 + (i < b.length ? b[i] : 0) * 0.55;
-  return out;
+  return renderChipTracks([
+    { notes: melody, settings: { wave: "square50", vibrato: 0.15, decay: 0.25 }, gain: 0.7 },
+    { notes: bass, settings: { wave: "triangle", vibrato: 0, decay: 0.1 }, gain: 0.55 },
+  ], sampleRate);
 }
 
 // ---- プリセット（data） ----
@@ -776,7 +1170,10 @@ const PURE = {
   crushQuantize, createCrushState, processCrush, encodeWavPcm16,
   mixToMono, downsampleTo, frameRms, yinPitch, freqToMidi, midiToFreq,
   medianFilterNullable, medianOf, circularMeanFraction, framesToNotes,
-  renderChip, buildDemoNotes, renderDemoSong,
+  fftRadix2, hannWindow, fftMagnitude, interpMag, harmonicSalience,
+  midiGridRange, buildSalienceRow, viterbiPitchTrack, trackToFrames,
+  detectOnsets, renderDrums, analyzePolyphonicSteps,
+  renderChip, mixFloat32, renderChipTracks, buildDemoNotes, renderDemoSong,
   BUILTIN_PRESETS,
 };
 if (typeof module !== "undefined" && module.exports) module.exports = PURE;
@@ -790,9 +1187,15 @@ if (typeof module !== "undefined" && module.exports) module.exports = PURE;
 /* ===== 定数 ===== */
 const MAX_DURATION_SEC = 600;      // 10分制限（design.md リスク3）
 const ANALYZE_LIMIT_SEC = 120;     // モードB解析上限
-const ANALYZE_TARGET_RATE = 11025; // YIN用ダウンサンプル先
+const ANALYZE_TARGET_RATE = 11025; // YIN（単音）用ダウンサンプル先
+const POLY_TARGET_RATE = 22050;    // 多声解析用ダウンサンプル先
 const YIN_FRAME = 1024;
 const STORAGE_KEY = "picolab.settings";
+const TRACK_DEFS = [
+  { toggleId: "t-melody", key: "notes",        color: "#6ee787" },
+  { toggleId: "t-harmony", key: "notesHarmony", color: "#58a6ff" },
+  { toggleId: "t-bass",   key: "notesBass",    color: "#ffb454" },
+];
 
 /* ===== 状態管理 ===== */
 const app = {
@@ -818,8 +1221,12 @@ const app = {
   userPresets: [],
   activePresetName: "ファミコン風",
 
-  notes: null,             // モードBの解析結果
-  chipBuffer: null,        // renderChip 済み AudioBuffer
+  analysisMode: "poly",    // "poly"=曲・伴奏入り / "mono"=単音録音
+  notes: null,             // メロディトラック
+  notesHarmony: null,      // ハモリトラック（多声解析のみ）
+  notesBass: null,         // ベーストラック（多声解析のみ）
+  drumHits: null,          // ドラム打撃列（多声解析のみ）
+  chipBuffer: null,        // レンダリング済み AudioBuffer
   analyzing: false,
   analyzedTruncated: false,
 };
@@ -986,6 +1393,9 @@ function setBuffer(buffer, name) {
   app.fileName = name;
   app.offset = 0;
   app.notes = null;
+  app.notesHarmony = null;
+  app.notesBass = null;
+  app.drumHits = null;
   app.chipBuffer = null;
   app.wavePeaks = computePeaks(buffer, 1200);
 
@@ -997,6 +1407,7 @@ function setBuffer(buffer, name) {
   // モードBの結果をリセット
   $("pianoroll").classList.add("hidden");
   $("chip-controls").classList.add("hidden");
+  $("track-toggles").classList.add("hidden");
   $("analyze-status").textContent = "";
   $("progress-wrap").classList.add("hidden");
 
@@ -1253,6 +1664,15 @@ function saveUserPreset() {
 
 /* ===== モードB: 解析（transcribe）と再合成（chipsynth） ===== */
 
+function hasAnyChipTrack() {
+  return Boolean(
+    (app.notes && app.notes.length) ||
+    (app.notesHarmony && app.notesHarmony.length) ||
+    (app.notesBass && app.notesBass.length) ||
+    (app.drumHits && app.drumHits.length)
+  );
+}
+
 async function analyzeCurrentBuffer() {
   if (!app.buffer || app.analyzing) return;
   app.analyzing = true;
@@ -1270,36 +1690,64 @@ async function analyzeCurrentBuffer() {
     if (app.analyzedTruncated) {
       mono = mono.subarray(0, Math.floor(ANALYZE_LIMIT_SEC * app.buffer.sampleRate));
     }
-    const ds = downsampleTo(mono, app.buffer.sampleRate, ANALYZE_TARGET_RATE);
-    const hop = Math.round(ds.rate * 0.01); // 10ms
-    const totalFrames = Math.max(0, Math.floor((ds.data.length - YIN_FRAME) / hop));
-    const frames = [];
-    const CHUNK = 200;
+    app.analysisMode = $("b-mode").value;
 
-    for (let f = 0; f < totalFrames; f += CHUNK) {
-      const end = Math.min(totalFrames, f + CHUNK);
-      for (let i = f; i < end; i++) {
-        const frame = ds.data.subarray(i * hop, i * hop + YIN_FRAME);
-        const pitch = yinPitch(frame, ds.rate, 70, 1200);
-        frames.push(pitch ? { freq: pitch.freq, clarity: pitch.clarity, rms: frameRms(frame) } : null);
+    if (app.analysisMode === "mono") {
+      // 単音録音: YIN（時間領域）
+      const ds = downsampleTo(mono, app.buffer.sampleRate, ANALYZE_TARGET_RATE);
+      const hop = Math.round(ds.rate * 0.01); // 10ms
+      const totalFrames = Math.max(0, Math.floor((ds.data.length - YIN_FRAME) / hop));
+      const frames = [];
+      const CHUNK = 200;
+      for (let f = 0; f < totalFrames; f += CHUNK) {
+        const end = Math.min(totalFrames, f + CHUNK);
+        for (let i = f; i < end; i++) {
+          const frame = ds.data.subarray(i * hop, i * hop + YIN_FRAME);
+          const pitch = yinPitch(frame, ds.rate, 70, 1200);
+          frames.push(pitch ? { freq: pitch.freq, clarity: pitch.clarity, rms: frameRms(frame) } : null);
+        }
+        $("analyze-progress").style.width = `${Math.round((end / totalFrames) * 100)}%`;
+        // UIを固めないため1チャンクごとにイベントループへ返す
+        await new Promise((r) => setTimeout(r, 0));
       }
-      $("analyze-progress").style.width = `${Math.round((end / totalFrames) * 100)}%`;
-      // UIを固めないため1チャンクごとにイベントループへ返す
-      await new Promise((r) => setTimeout(r, 0));
+      app.notes = framesToNotes(frames, hop / ds.rate, { minDur: 0.05, minClarity: 0.45 });
+      app.notesHarmony = null;
+      app.notesBass = null;
+      app.drumHits = null;
+    } else {
+      // 曲・伴奏入り: スペクトル解析（メロディ＋ハモリ＋ベース＋ドラム）
+      const ds = downsampleTo(mono, app.buffer.sampleRate, POLY_TARGET_RATE);
+      const it = analyzePolyphonicSteps(ds.data, ds.rate, {});
+      let result = null;
+      while (true) {
+        const step = it.next();
+        if (step.done) { result = step.value; break; }
+        $("analyze-progress").style.width =
+          `${Math.round((step.value.done / Math.max(1, step.value.total)) * 100)}%`;
+        await new Promise((r) => setTimeout(r, 0));
+      }
+      app.notes = result.melody;
+      app.notesHarmony = result.harmony;
+      app.notesBass = result.bass;
+      app.drumHits = result.drums;
     }
-
-    app.notes = framesToNotes(frames, hop / ds.rate, {});
     app.chipBuffer = null;
 
-    if (app.notes.length === 0) {
-      $("analyze-status").textContent = "ノートを検出できませんでした（単音の録音向けの機能です）";
+    if (!hasAnyChipTrack()) {
+      $("analyze-status").textContent = "音を検出できませんでした（音源タイプを変えて試してください）";
       $("pianoroll").classList.add("hidden");
       $("chip-controls").classList.add("hidden");
+      $("track-toggles").classList.add("hidden");
     } else {
+      const parts = [`メロディ${app.notes.length}`];
+      if (app.notesHarmony) parts.push(`ハモリ${app.notesHarmony.length}`);
+      if (app.notesBass) parts.push(`ベース${app.notesBass.length}`);
+      if (app.drumHits) parts.push(`ドラム${app.drumHits.length}`);
       $("analyze-status").textContent =
-        `${app.notes.length}個のノートを検出` + (app.analyzedTruncated ? "（先頭120秒のみ解析）" : "");
+        `${parts.join("・")} を検出` + (app.analyzedTruncated ? "（先頭120秒のみ解析）" : "");
       $("pianoroll").classList.remove("hidden");
       $("chip-controls").classList.remove("hidden");
+      $("track-toggles").classList.toggle("hidden", app.analysisMode === "mono");
       resizeCanvases();
       drawPianoroll();
     }
@@ -1313,32 +1761,79 @@ async function analyzeCurrentBuffer() {
   }
 }
 
+// 有効トラックをまとめてレンダリング（試聴・書き出し共用）
+function renderPerformance(sampleRate) {
+  const isOn = (id) => $(id).checked;
+  const parts = [], gains = [];
+  if (app.notes && app.notes.length && isOn("t-melody")) {
+    parts.push(renderChip(app.notes, app.chip, sampleRate));
+    gains.push(0.8);
+  }
+  if (app.notesHarmony && app.notesHarmony.length && isOn("t-harmony")) {
+    parts.push(renderChip(app.notesHarmony,
+      { wave: "square25", vibrato: app.chip.vibrato * 0.5, decay: app.chip.decay }, sampleRate));
+    gains.push(0.45);
+  }
+  if (app.notesBass && app.notesBass.length && isOn("t-bass")) {
+    parts.push(renderChip(app.notesBass, { wave: "triangle", vibrato: 0, decay: 0.15 }, sampleRate));
+    gains.push(0.6);
+  }
+  if (app.drumHits && app.drumHits.length && isOn("t-drums")) {
+    parts.push(renderDrums(app.drumHits, sampleRate));
+    gains.push(0.7);
+  }
+  if (parts.length === 0) return null;
+  return mixFloat32(parts, gains);
+}
+
 function drawPianoroll() {
   const c = $("pianoroll");
   const g = c.getContext("2d");
   g.clearRect(0, 0, c.width, c.height);
-  if (!app.notes || app.notes.length === 0) return;
+  if (!hasAnyChipTrack()) return;
+
+  const DRUM_LANE = 12; // 下端のドラム表示帯（px・キャンバス座標）
   let minMidi = 127, maxMidi = 0, maxT = 0.1;
-  for (const n of app.notes) {
-    if (n.midi < minMidi) minMidi = n.midi;
-    if (n.midi > maxMidi) maxMidi = n.midi;
-    if (n.start + n.dur > maxT) maxT = n.start + n.dur;
+  for (const def of TRACK_DEFS) {
+    const notes = app[def.key];
+    if (!notes) continue;
+    for (const n of notes) {
+      if (n.midi < minMidi) minMidi = n.midi;
+      if (n.midi > maxMidi) maxMidi = n.midi;
+      if (n.start + n.dur > maxT) maxT = n.start + n.dur;
+    }
   }
+  if (app.drumHits) for (const h of app.drumHits) if (h.t > maxT) maxT = h.t;
+  if (minMidi > maxMidi) { minMidi = 60; maxMidi = 72; }
   minMidi -= 2; maxMidi += 2;
+  const laneH = app.drumHits && app.drumHits.length ? DRUM_LANE : 0;
   const rows = maxMidi - minMidi + 1;
-  const rowH = c.height / rows;
+  const rowH = (c.height - laneH) / rows;
+  const noteY = (midi) => c.height - laneH - (midi - minMidi + 1) * rowH;
+
   // オクターブの目安線（C）
   g.fillStyle = "rgba(255,255,255,0.05)";
   for (let m = minMidi; m <= maxMidi; m++) {
-    if (m % 12 === 0) g.fillRect(0, c.height - (m - minMidi + 1) * rowH, c.width, 1);
+    if (m % 12 === 0) g.fillRect(0, noteY(m), c.width, 1);
   }
-  g.fillStyle = "#6ee787";
-  for (const n of app.notes) {
-    const x = (n.start / maxT) * c.width;
-    const w = Math.max(2, (n.dur / maxT) * c.width - 1);
-    const y = c.height - (n.midi - minMidi + 1) * rowH;
-    g.globalAlpha = 0.5 + 0.5 * n.vel;
-    g.fillRect(x, y, w, Math.max(2, rowH - 1));
+  for (const def of TRACK_DEFS) {
+    const notes = app[def.key];
+    if (!notes || !$(def.toggleId).checked) continue;
+    g.fillStyle = def.color;
+    for (const n of notes) {
+      const x = (n.start / maxT) * c.width;
+      const w = Math.max(2, (n.dur / maxT) * c.width - 1);
+      g.globalAlpha = 0.5 + 0.5 * n.vel;
+      g.fillRect(x, noteY(n.midi), w, Math.max(2, rowH - 1));
+    }
+  }
+  if (app.drumHits && $("t-drums").checked) {
+    g.fillStyle = "#8791b3";
+    for (const h of app.drumHits) {
+      const x = (h.t / maxT) * c.width;
+      g.globalAlpha = 0.4 + 0.6 * h.strength;
+      g.fillRect(x, c.height - laneH + 2, 2, laneH - 4);
+    }
   }
   g.globalAlpha = 1;
 }
@@ -1369,11 +1864,12 @@ function applyChipToControls() {
 let chipSource = null;
 async function toggleChipPlayback() {
   if (app.playingChip) { stopChipPlayback(); return; }
-  if (!app.notes || app.notes.length === 0) return;
+  if (!hasAnyChipTrack()) return;
   await ensureAudio();
   stopPlayback();
   if (!app.chipBuffer) {
-    const data = renderChip(app.notes, app.chip, app.ctx.sampleRate);
+    const data = renderPerformance(app.ctx.sampleRate);
+    if (!data || data.length === 0) return;
     app.chipBuffer = app.ctx.createBuffer(1, data.length, app.ctx.sampleRate);
     app.chipBuffer.copyToChannel(data, 0);
   }
@@ -1425,13 +1921,13 @@ function switchTab(tab) {
 function openExportDialog() {
   if (!app.buffer) return;
   const isChip = app.activeTab === "b";
-  if (isChip && (!app.notes || app.notes.length === 0)) {
+  if (isChip && !hasAnyChipTrack()) {
     $("analyze-status").textContent = "書き出す前に「この音源を解析する」を実行してください";
     return;
   }
   $("export-source-label").textContent = isChip
-    ? "書き出す内容: モードB（ピコピコ再合成・モノラル固定）"
-    : "書き出す内容: モードA（現在のパラメータで8bitエフェクトを適用）";
+    ? "書き出す内容: ピコピコ再合成（チェック中のトラック・モノラル固定）"
+    : "書き出す内容: 8bitエフェクト（現在のパラメータを適用）";
   $("e-mono").disabled = isChip;
   if (isChip) $("e-mono").checked = true;
   $("export-error").textContent = "";
@@ -1449,8 +1945,10 @@ async function runExport() {
     let channels, suffix;
 
     if (app.activeTab === "b") {
-      // モードB: チップシンセを目的レートで直接レンダリング（常にモノラル）
-      channels = [renderChip(app.notes, app.chip, outRate)];
+      // ピコピコ再合成: 有効トラックを目的レートで直接レンダリング（常にモノラル）
+      const data = renderPerformance(outRate);
+      if (!data) throw new Error("書き出すトラックがありません");
+      channels = [data];
       suffix = "picopico";
     } else {
       // モードA: 純関数でクラッシュ → OfflineAudioContextでフィルタ＋リサンプル
@@ -1512,6 +2010,7 @@ function saveSettingsDebounced() {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify({
         params: app.params, chip: app.chip, userPresets: app.userPresets,
+        analysisMode: app.analysisMode,
       }));
     } catch (e) { /* プライベートブラウズ等で失敗しても動作継続 */ }
   }, 300);
@@ -1525,6 +2024,7 @@ function loadSettings() {
     if (s.params && typeof s.params.bits === "number") app.params = Object.assign({}, app.params, s.params);
     if (s.chip && typeof s.chip.wave === "string") app.chip = Object.assign({}, app.chip, s.chip);
     if (Array.isArray(s.userPresets)) app.userPresets = s.userPresets;
+    if (s.analysisMode === "mono" || s.analysisMode === "poly") app.analysisMode = s.analysisMode;
     app.activePresetName = null;
   } catch (e) { /* 壊れた保存データは無視して既定値で起動 */ }
 }
@@ -1566,6 +2066,17 @@ function bindEvents() {
   // モードB
   $("btn-analyze").addEventListener("click", analyzeCurrentBuffer);
   $("btn-chip-play").addEventListener("click", toggleChipPlayback);
+  $("b-mode").addEventListener("change", () => {
+    app.analysisMode = $("b-mode").value;
+    saveSettingsDebounced();
+  });
+  for (const id of ["t-melody", "t-harmony", "t-bass", "t-drums"]) {
+    $(id).addEventListener("change", () => {
+      stopChipPlayback();
+      app.chipBuffer = null; // トラック構成が変わったので再レンダリング
+      drawPianoroll();
+    });
+  }
 
   // 書き出し
   $("btn-export").addEventListener("click", openExportDialog);
@@ -1582,7 +2093,7 @@ function bindEvents() {
     if (e.code === "Space") {
       e.preventDefault();
       if (screenEditor.classList.contains("hidden")) return;
-      if (app.activeTab === "b" && app.notes && app.notes.length > 0) toggleChipPlayback();
+      if (app.activeTab === "b" && hasAnyChipTrack()) toggleChipPlayback();
       else togglePlayback();
     } else if (/^Digit[1-5]$/.test(e.code) && !screenEditor.classList.contains("hidden")) {
       const idx = Number(e.code.slice(5)) - 1;
@@ -1606,6 +2117,7 @@ loadSettings();
 renderPresetBar();
 applyParamsToControls();
 applyChipToControls();
+$("b-mode").value = app.analysisMode;
 bindParamControls();
 bindChipControls();
 bindEvents();
