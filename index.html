@@ -293,6 +293,9 @@ footer a { color: var(--dim); }
       </div>
       <div class="row-actions">
         <button id="btn-analyze" class="primary">この音源を解析する</button>
+        <label id="ai-toggle-label" title="Spotify basic-pitch（ローカル同梱・約2MB）で採譜。精度が大きく上がります">
+          <input type="checkbox" id="b-ai" checked> AI採譜（推奨）
+        </label>
         <span class="note" id="analyze-status"></span>
       </div>
       <div class="progress-wrap hidden" id="progress-wrap"><div id="analyze-progress"></div></div>
@@ -974,6 +977,47 @@ function renderDrums(hits, sampleRate) {
   return out;
 }
 
+// ---- ボイス割当: 多声ノート列 → ファミコン単旋律トラック ----
+// AI採譜（basic-pitch）は同時発音を含む全ノートを返すため、
+// メロディ（最高声部）・ハモリ（第2声部）・ベース（低音）の単旋律3声へ割り当てる
+
+function assignVoices(notes, opts) {
+  const o = Object.assign({ bassCut: 52, overlapTol: 0.03 }, opts);
+  const lastEnd = (arr) => arr.length ? arr[arr.length - 1].start + arr[arr.length - 1].dur : -Infinity;
+  // 同時発音は高い音を優先して先に処理する
+  const upper = notes.filter((n) => n.midi >= o.bassCut)
+    .sort((a, b) => a.start - b.start || b.midi - a.midi);
+  const melody = [], harmony = [];
+  for (const n of upper) {
+    if (n.start >= lastEnd(melody) - o.overlapTol) { melody.push(Object.assign({}, n)); continue; }
+    const lm = melody[melody.length - 1];
+    if (n.midi > lm.midi && n.start > lm.start + 0.02) {
+      // 鳴っている音より高い音が後から来たら旋律を乗り換える（前の音は切る）
+      lm.dur = Math.max(0.02, n.start - lm.start);
+      melody.push(Object.assign({}, n));
+      continue;
+    }
+    if (n.start >= lastEnd(harmony) - o.overlapTol) { harmony.push(Object.assign({}, n)); continue; }
+    // どのトラックにも入らない音（和音の内声）は捨てる
+  }
+  // ベースは低い音を優先する単旋律
+  const bass = [];
+  const lower = notes.filter((n) => n.midi < o.bassCut)
+    .sort((a, b) => a.start - b.start || a.midi - b.midi);
+  for (const n of lower) {
+    if (n.start >= lastEnd(bass) - o.overlapTol) bass.push(Object.assign({}, n));
+  }
+  // 単旋律保証: 許容内の重なりをトリム
+  const trim = (arr) => {
+    for (let i = 0; i < arr.length - 1; i++) {
+      const overlap = arr[i].start + arr[i].dur - arr[i + 1].start;
+      if (overlap > 0) arr[i].dur = Math.max(0.02, arr[i + 1].start - arr[i].start);
+    }
+    return arr;
+  };
+  return { melody: trim(melody), harmony: trim(harmony), bass: trim(bass) };
+}
+
 // ---- リズム後処理: テンポ推定・グリッド吸着・レガート ----
 
 // オンセットフラックス列の自己相関からビート周期を推定する。
@@ -1132,6 +1176,7 @@ function* analyzePolyphonicSteps(data, rate, opts) {
     lowFluxHz: 250,                  // ドラム特徴: 低域フラックスの上限
     binLimitHz: 8000,                // スペクトログラム保持上限（メモリ節約）
     hpssHalfTime: 6, hpssHalfFreq: 6, // HPSSメディアン窓の片幅（約±60ms / ±65Hz）
+    drumsOnly: false,                // true: ドラムとテンポだけ抽出（AI採譜と併用する）
     yieldEvery: 50,
   }, opts);
   const hop = Math.max(1, Math.round(rate * o.hopSec));
@@ -1169,14 +1214,16 @@ function* analyzePolyphonicSteps(data, rate, opts) {
   const melRows = [], bassRows = [], fundRows = [], features = [];
   for (let f = 0; f < total; f++) {
     const mag = harmMags[f];
-    melRows.push(buildSalienceRow(mag, o.frameSize, rate, melGrid, o.melodyHarm, o.melodyDecay));
-    bassRows.push(buildSalienceRow(mag, o.frameSize, rate, bassGrid, o.bassHarm, o.bassDecay));
-    // 各候補ピッチの「基音そのもの」の強さ（ハモリのゴースト判定用）
-    const fundRow = new Float32Array(melGrid.length);
-    for (let s = 0; s < melGrid.length; s++) {
-      fundRow[s] = interpMag(mag, (midiToFreq(melGrid[s]) * o.frameSize) / rate);
+    if (!o.drumsOnly) {
+      melRows.push(buildSalienceRow(mag, o.frameSize, rate, melGrid, o.melodyHarm, o.melodyDecay));
+      bassRows.push(buildSalienceRow(mag, o.frameSize, rate, bassGrid, o.bassHarm, o.bassDecay));
+      // 各候補ピッチの「基音そのもの」の強さ（ハモリのゴースト判定用）
+      const fundRow = new Float32Array(melGrid.length);
+      for (let s = 0; s < melGrid.length; s++) {
+        fundRow[s] = interpMag(mag, (midiToFreq(melGrid[s]) * o.frameSize) / rate);
+      }
+      fundRows.push(fundRow);
     }
-    fundRows.push(fundRow);
     // ドラム特徴: 打撃成分の正のフラックス＋低域比＋重心＋拡散度＋打撃比
     const perc = percMags[f];
     const prevPerc = f > 0 ? percMags[f - 1] : null;
@@ -1214,6 +1261,14 @@ function* analyzePolyphonicSteps(data, rate, opts) {
   yield { done: totalUnits, total: totalUnits };
 
   const hopTime = hop / rate;
+  if (o.drumsOnly) {
+    // AI採譜と併用時: ピッチ系はAIに任せ、ドラムとテンポだけ返す
+    return {
+      melody: [], harmony: [], bass: [],
+      drums: detectOnsets(features, hopTime, {}),
+      tempo: estimateTempo(features.map((f) => f.flux), hopTime, {}),
+    };
+  }
   // メロディ: 最も目立つ旋律線。ゲートを緩めて取りこぼしを減らす
   const melPath = viterbiPitchTrack(melRows, o.gridStep, o.lambdaPerSemi, o.jumpCap);
   const melody = framesToNotes(trackToFrames(melRows, melPath, melGrid), hopTime, {
@@ -1400,7 +1455,7 @@ const PURE = {
   fftRadix2, hannWindow, fftMagnitude, interpMag, harmonicSalience,
   medianOfWindow, hpssFrame,
   midiGridRange, buildSalienceRow, viterbiPitchTrack, trackToFrames,
-  detectOnsets, renderDrums, analyzePolyphonicSteps,
+  detectOnsets, renderDrums, analyzePolyphonicSteps, assignVoices,
   estimateTempo, quantizeNotes, quantizeDrums, legatoNotes, fixOctaveOutliers,
   renderChip, mixFloat32, renderChipTracks, buildDemoNotes, renderDemoSong,
   BUILTIN_PRESETS,
@@ -1456,6 +1511,7 @@ const app = {
   notesBass: null,         // ベーストラック（多声解析のみ）
   drumHits: null,          // ドラム打撃列（多声解析のみ）
   tempoGrid: null,         // 推定テンポ {beat, grid, phase}（リズム補正用）
+  usedAI: false,           // 直近の解析でAI採譜を使ったか
   chipBuffer: null,        // レンダリング済み AudioBuffer
   analyzing: false,
   analyzedTruncated: false,
@@ -1895,6 +1951,67 @@ function saveUserPreset() {
 
 /* ===== モードB: 解析（transcribe）と再合成（chipsynth） ===== */
 
+/* ===== AI採譜（basic-pitch・ローカル同梱） ===== */
+
+// vendor/basic-pitch.js（TFJS込みバンドル）とモデルを遅延ロードする。
+// file:// ではモデルのfetchができないため利用不可 → 従来エンジンにフォールバック
+let basicPitchPromise = null;
+function aiAvailable() {
+  return location.protocol === "http:" || location.protocol === "https:";
+}
+function loadBasicPitch() {
+  if (!basicPitchPromise) {
+    basicPitchPromise = new Promise((resolve, reject) => {
+      const s = document.createElement("script");
+      s.src = "vendor/basic-pitch.js";
+      s.onload = () => {
+        try {
+          resolve(new BasicPitchLib.BasicPitch("vendor/model/model.json"));
+        } catch (e) { reject(e); }
+      };
+      s.onerror = () => reject(new Error("AI採譜バンドルを読み込めませんでした"));
+      document.head.appendChild(s);
+    }).catch((e) => {
+      basicPitchPromise = null; // 次回リトライできるように
+      throw e;
+    });
+  }
+  return basicPitchPromise;
+}
+
+// AudioBuffer → basic-pitchが要求する 22050Hz モノラル Float32Array
+async function resampleTo22050Mono(buffer) {
+  const RATE = 22050;
+  const off = new OfflineAudioContext(1, Math.ceil(buffer.duration * RATE), RATE);
+  const src = off.createBufferSource();
+  src.buffer = buffer;
+  src.connect(off.destination);
+  src.start();
+  const rendered = await off.startRendering();
+  return rendered.getChannelData(0);
+}
+
+// AI採譜の本体: 多声ノートを推論 → ファミコン3声へ割当
+async function analyzeWithAI(buffer, limitSec, onProgress) {
+  const bp = await loadBasicPitch();
+  let audio = await resampleTo22050Mono(buffer);
+  if (audio.length > limitSec * 22050) audio = audio.subarray(0, Math.floor(limitSec * 22050));
+  const frames = [], onsets = [], contours = [];
+  await bp.evaluateModel(audio, (f, on, c) => {
+    frames.push(...f); onsets.push(...on); contours.push(...c);
+  }, (pct) => onProgress(pct));
+  const events = BasicPitchLib.noteFramesToTime(
+    BasicPitchLib.addPitchBendsToNoteEvents(contours,
+      BasicPitchLib.outputToNotesPoly(frames, onsets, 0.5, 0.3, 5)));
+  const notes = events.map((e) => ({
+    start: e.startTimeSeconds,
+    dur: e.durationSeconds,
+    midi: e.pitchMidi,
+    vel: Math.max(0.2, Math.min(1, e.amplitude)),
+  }));
+  return assignVoices(notes, {});
+}
+
 function hasAnyChipTrack() {
   return Boolean(
     (app.notes && app.notes.length) ||
@@ -1946,23 +2063,40 @@ async function analyzeCurrentBuffer() {
       app.notesBass = null;
       app.drumHits = null;
       app.tempoGrid = null;
+      app.usedAI = false;
     } else {
-      // 曲・伴奏入り: スペクトル解析（メロディ＋ハモリ＋ベース＋ドラム）
+      // 曲・伴奏入り: AI採譜（basic-pitch）が使えればそちらを優先し、
+      // ドラムとテンポは打撃成分の解析（HPSS）で補完する。
+      // AI不可（file://・ロード失敗）時は従来のスペクトル解析へフォールバック
+      const useAI = $("b-ai").checked && aiAvailable();
+      let aiResult = null;
+      if (useAI) {
+        try {
+          $("analyze-status").textContent = "AI採譜モデルで解析中…";
+          aiResult = await analyzeWithAI(app.buffer, ANALYZE_LIMIT_SEC, (pct) => {
+            $("analyze-progress").style.width = `${Math.round(pct * 70)}%`;
+          });
+        } catch (err) {
+          console.warn("AI採譜が使えないため従来エンジンで解析:", err);
+        }
+      }
       const ds = downsampleTo(mono, app.buffer.sampleRate, POLY_TARGET_RATE);
-      const it = analyzePolyphonicSteps(ds.data, ds.rate, {});
+      const it = analyzePolyphonicSteps(ds.data, ds.rate, { drumsOnly: Boolean(aiResult) });
       let result = null;
       while (true) {
         const step = it.next();
         if (step.done) { result = step.value; break; }
+        const frac = step.value.done / Math.max(1, step.value.total);
         $("analyze-progress").style.width =
-          `${Math.round((step.value.done / Math.max(1, step.value.total)) * 100)}%`;
+          aiResult ? `${70 + Math.round(frac * 30)}%` : `${Math.round(frac * 100)}%`;
         await new Promise((r) => setTimeout(r, 0));
       }
-      app.notes = result.melody;
-      app.notesHarmony = result.harmony;
-      app.notesBass = result.bass;
+      app.notes = aiResult ? aiResult.melody : result.melody;
+      app.notesHarmony = aiResult ? aiResult.harmony : result.harmony;
+      app.notesBass = aiResult ? aiResult.bass : result.bass;
       app.drumHits = result.drums;
       app.tempoGrid = result.tempo;
+      app.usedAI = Boolean(aiResult);
     }
     app.chipBuffer = null;
 
@@ -1976,9 +2110,10 @@ async function analyzeCurrentBuffer() {
       if (app.notesHarmony) parts.push(`ハモリ${app.notesHarmony.length}`);
       if (app.notesBass) parts.push(`ベース${app.notesBass.length}`);
       if (app.drumHits) parts.push(`ドラム${app.drumHits.length}`);
+      const engine = app.analysisMode === "mono" ? "" : (app.usedAI ? "AI採譜: " : "従来解析: ");
       const bpm = app.tempoGrid ? `／テンポ約${Math.round(60 / app.tempoGrid.beat)}BPM` : "";
       $("analyze-status").textContent =
-        `${parts.join("・")} を検出${bpm}` + (app.analyzedTruncated ? "（先頭120秒のみ解析）" : "");
+        `${engine}${parts.join("・")} を検出${bpm}` + (app.analyzedTruncated ? "（先頭120秒のみ解析）" : "");
       $("pianoroll").classList.remove("hidden");
       $("chip-controls").classList.remove("hidden");
       $("track-toggles").classList.toggle("hidden", app.analysisMode === "mono");
@@ -2375,6 +2510,12 @@ renderPresetBar();
 applyParamsToControls();
 applyChipToControls();
 $("b-mode").value = app.analysisMode;
+if (!aiAvailable()) {
+  // file:// で開いた場合はAI採譜（モデルfetch）が使えない
+  $("b-ai").checked = false;
+  $("b-ai").disabled = true;
+  $("ai-toggle-label").title = "AI採譜はhttp(s)経由（公開URL等）でのみ使えます";
+}
 bindParamControls();
 bindChipControls();
 bindEvents();

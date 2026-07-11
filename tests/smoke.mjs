@@ -54,6 +54,7 @@ window.addEventListener("load", async () => {
     // 3) モードB: 解析パイプライン
     await analyzeCurrentBuffer();
     out.push("notes=" + (app.notes ? app.notes.length : "null"));
+    out.push("ai=" + app.usedAI);
     step("analyze");
     // 4) モードA書き出し経路: 純関数クラッシュ → オフラインレンダ(フィルタ+リサンプル) → WAV
     const srcChs = [buffer.getChannelData(0)];
@@ -102,11 +103,24 @@ function runEdge(url) {
 const fileTitle = runEdge("file:///" + resolve(phtml).replace(/\\/g, "/"));
 console.log("file:// :", fileTitle);
 
-// 2) http://localhost で検証（GitHub Pages相当）
+// 2) http://localhost で検証（GitHub Pages相当）。
+// vendor/（AI採譜バンドル・モデル）も静的配信し、AI経路を実際に通す
 const { createServer } = await import("node:http");
+const { existsSync } = await import("node:fs");
+const { extname, dirname } = await import("node:path");
+const appDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const MIME = { ".html": "text/html; charset=utf-8", ".js": "text/javascript", ".json": "application/json", ".bin": "application/octet-stream" };
 const server = createServer((req, res) => {
-  res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-  res.end(patched);
+  const urlPath = req.url.split("?")[0];
+  if (urlPath === "/" || urlPath === "/index.html") {
+    res.writeHead(200, { "Content-Type": MIME[".html"] });
+    res.end(patched);
+    return;
+  }
+  const file = join(appDir, urlPath.replace(/^\//, "").replace(/\.\./g, ""));
+  if (!existsSync(file)) { res.writeHead(404); res.end("not found"); return; }
+  res.writeHead(200, { "Content-Type": MIME[extname(file)] || "application/octet-stream" });
+  res.end(readFileSync(file));
 });
 await new Promise((r) => server.listen(0, "127.0.0.1", r));
 // 注意: spawnSyncはNodeのイベントループを塞ぎ、この自前サーバーが応答できなくなる。
@@ -114,9 +128,9 @@ await new Promise((r) => server.listen(0, "127.0.0.1", r));
 let httpTitle;
 try {
   const { stdout } = await execFileAsync(EDGE,
-    ["--headless", "--disable-gpu", "--dump-dom", "--virtual-time-budget=180000",
+    ["--headless", "--disable-gpu", "--dump-dom", "--virtual-time-budget=600000",
       `http://127.0.0.1:${server.address().port}/`],
-    { maxBuffer: 64 * 1024 * 1024, timeout: 120000, killSignal: "SIGKILL" });
+    { maxBuffer: 64 * 1024 * 1024, timeout: 300000, killSignal: "SIGKILL" });
   const m = (stdout || "").match(/<title>([^<]*)<\/title>/);
   httpTitle = m ? m[1] : "(取得失敗)";
 } catch (e) {

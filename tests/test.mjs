@@ -478,6 +478,61 @@ test("統合: 本物のハモリは検出され、メロディだけの音源で
     `ハモリ検出 2/3 以上（実際: ${harmMidis.join(",")}）`);
 });
 
+// ---- ボイス割当（AI採譜の多声ノート → ファミコン3声） ----
+
+test("assignVoices: 和音は上からメロディ/ハモリ、低音はベースへ", () => {
+  const notes = [
+    { start: 0, dur: 0.5, midi: 67, vel: 1 },   // G4 → メロディ
+    { start: 0, dur: 0.5, midi: 64, vel: 0.8 }, // E4 → ハモリ
+    { start: 0, dur: 0.5, midi: 60, vel: 0.8 }, // C4 → 捨て（内声）
+    { start: 0, dur: 0.5, midi: 36, vel: 0.9 }, // C2 → ベース
+  ];
+  const v = P.assignVoices(notes, {});
+  assert.equal(v.melody.length, 1);
+  assert.equal(v.melody[0].midi, 67);
+  assert.equal(v.harmony.length, 1);
+  assert.equal(v.harmony[0].midi, 64);
+  assert.equal(v.bass.length, 1);
+  assert.equal(v.bass[0].midi, 36);
+});
+
+test("assignVoices: 逐次のメロディはそのまま通る", () => {
+  const notes = [
+    { start: 0.0, dur: 0.2, midi: 60, vel: 1 },
+    { start: 0.25, dur: 0.2, midi: 62, vel: 1 },
+    { start: 0.5, dur: 0.2, midi: 64, vel: 1 },
+  ];
+  const v = P.assignVoices(notes, {});
+  assert.deepEqual(v.melody.map((n) => n.midi).join(","), "60,62,64");
+  assert.equal(v.harmony.length, 0);
+});
+
+test("assignVoices: 鳴っている音より高い音が来たら旋律を乗り換える", () => {
+  const notes = [
+    { start: 0.0, dur: 1.0, midi: 60, vel: 1 },  // 長いC4
+    { start: 0.3, dur: 0.4, midi: 67, vel: 1 },  // 途中から高いG4 → メロディ乗り換え
+  ];
+  const v = P.assignVoices(notes, {});
+  assert.equal(v.melody.length, 2);
+  assert.equal(v.melody[1].midi, 67);
+  approx(v.melody[0].dur, 0.3, 1e-9, "前の音は切られる");
+});
+
+test("assignVoices: 各トラックは重ならない（単旋律保証）", () => {
+  const notes = [
+    { start: 0.0, dur: 0.5, midi: 60, vel: 1 },
+    { start: 0.3, dur: 0.5, midi: 58, vel: 1 }, // 低い音はハモリへ
+    { start: 0.6, dur: 0.5, midi: 62, vel: 1 },
+  ];
+  const v = P.assignVoices(notes, {});
+  for (const track of [v.melody, v.harmony, v.bass]) {
+    for (let i = 0; i < track.length - 1; i++) {
+      assert.ok(track[i].start + track[i].dur <= track[i + 1].start + 1e-9,
+        `重なりなし: ${JSON.stringify(track)}`);
+    }
+  }
+});
+
 // ---- リズム後処理 ----
 
 test("estimateTempo: 周期的なフラックスからビートを推定", () => {
