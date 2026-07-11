@@ -325,6 +325,7 @@ footer a { color: var(--dim); }
         </div>
         <div class="row-actions">
           <button id="btn-chip-play" class="primary">▶ ピコピコ再生</button>
+          <label title="推定テンポの16分グリッドに吸着＋レガート化"><input type="checkbox" id="c-quantize" checked> リズム補正</label>
         </div>
       </div>
     </div>
@@ -845,6 +846,7 @@ function detectOnsets(features, hopTime, opts) {
     refractorySec: 0.07, // 連続検出の不応期
     kickLowRatio: 0.35,  // 低域フラックス比がこれ以上ならキック
     hatCentroidHz: 5500, // 重心がこれ以上ならハイハット
+    minSpread: 0.22,     // 拡散度がこれ未満（＝音程楽器のアタック）は原則除外
   }, opts);
   const n = features.length;
   if (n === 0) return [];
@@ -866,8 +868,10 @@ function detectOnsets(features, hopTime, opts) {
     const isPeak = flux[i] > flux[i - 1] && flux[i] >= flux[i + 1];
     const t = i * hopTime;
     if (!isPeak || flux[i] < threshold || t - lastT < o.refractorySec) continue;
-    lastT = t;
     const f = features[i];
+    // 音程楽器のアタック除け: 帯域拡散が低い立ち上がりは、よほど強くない限り打撃としない
+    if (f.spread !== undefined && f.spread < o.minSpread && flux[i] < 3 * threshold) continue;
+    lastT = t;
     let type = "snare";
     if (f.flux > 0 && f.lowFlux / f.flux >= o.kickLowRatio) type = "kick";
     else if (f.centroid >= o.hatCentroidHz) type = "hat";
@@ -909,6 +913,121 @@ function renderDrums(hits, sampleRate) {
   if (peak > 0.95) {
     const g = 0.95 / peak;
     for (let i = 0; i < out.length; i++) out[i] *= g;
+  }
+  return out;
+}
+
+// ---- リズム後処理: テンポ推定・グリッド吸着・レガート ----
+
+// オンセットフラックス列の自己相関からビート周期を推定する。
+// 戻り値: { beat, grid(=16分), phase } / 推定できなければ null
+function estimateTempo(fluxArr, hopTime, opts) {
+  const o = Object.assign({ minBeatSec: 0.3, maxBeatSec: 1.0, minTotalSec: 4 }, opts);
+  const n = fluxArr.length;
+  if (n * hopTime < o.minTotalSec) return null;
+  let mean = 0;
+  for (const v of fluxArr) mean += v;
+  mean /= n;
+  const f = fluxArr.map((v) => v - mean);
+  const lagLo = Math.max(1, Math.round(o.minBeatSec / hopTime));
+  const lagHi = Math.min(n - 2, Math.round(o.maxBeatSec / hopTime));
+  if (lagHi <= lagLo) return null;
+  const corr = new Float64Array(lagHi + 1);
+  let maxR = -Infinity;
+  for (let lag = lagLo; lag <= lagHi; lag++) {
+    let r = 0;
+    for (let i = 0; i + lag < n; i++) r += f[i] * f[i + lag];
+    corr[lag] = r / (n - lag);
+    if (corr[lag] > maxR) maxR = corr[lag];
+  }
+  if (maxR <= 0) return null;
+  // ビートの整数倍でも自己相関はほぼ同点になるため、
+  // 最大値の95%以上のうち最小のラグ（＝細かいビート）を採用する
+  let bestLag = -1;
+  for (let lag = lagLo; lag <= lagHi; lag++) {
+    if (corr[lag] >= 0.95 * maxR) { bestLag = lag; break; }
+  }
+  if (bestLag < 0) return null;
+  const beat = bestLag * hopTime;
+  const grid = beat / 4;
+  // 位相: グリッド上のフラックス合計が最大になるオフセットを探す
+  let bestPhase = 0, bestScore = -Infinity;
+  const gridFrames = grid / hopTime;
+  for (let off = 0; off < gridFrames; off++) {
+    let score = 0;
+    for (let k = off; k < n; k += gridFrames) score += fluxArr[Math.round(k)] || 0;
+    if (score > bestScore) { bestScore = score; bestPhase = off * hopTime; }
+  }
+  return { beat, grid, phase: bestPhase };
+}
+
+// ノート開始/終了をテンポグリッドに吸着させる（重なりは前のノートを詰める）
+function quantizeNotes(notes, gridSec, phase) {
+  if (!gridSec || gridSec <= 0) return notes;
+  const snap = (t) => phase + Math.round((t - phase) / gridSec) * gridSec;
+  const out = [];
+  for (const n of notes) {
+    const start = Math.max(0, snap(n.start));
+    let end = snap(n.start + n.dur);
+    if (end <= start) end = start + gridSec;
+    out.push(Object.assign({}, n, { start, dur: end - start }));
+  }
+  out.sort((a, b) => a.start - b.start);
+  const result = [];
+  for (const n of out) {
+    const last = result[result.length - 1];
+    if (last && n.start < last.start + last.dur) {
+      if (last.midi === n.midi) {
+        last.dur = Math.max(last.dur, n.start + n.dur - last.start);
+        continue;
+      }
+      last.dur = n.start - last.start;
+      if (last.dur <= 0) result.pop();
+    }
+    result.push(n);
+  }
+  return result;
+}
+
+// 打撃列をグリッドに吸着（同一スロットの同種打撃は1つに）
+function quantizeDrums(hits, gridSec, phase) {
+  if (!gridSec || gridSec <= 0) return hits;
+  const snap = (t) => Math.max(0, phase + Math.round((t - phase) / gridSec) * gridSec);
+  const seen = new Map();
+  for (const h of hits) {
+    const t = snap(h.t);
+    const key = `${t.toFixed(4)}:${h.type}`;
+    const prev = seen.get(key);
+    if (!prev || h.strength > prev.strength) seen.set(key, { t, type: h.type, strength: h.strength });
+  }
+  return [...seen.values()].sort((a, b) => a.t - b.t);
+}
+
+// 小さなすき間を埋めて音を繋げる（チップチューンはレガート気味のほうが自然）
+function legatoNotes(notes, maxGapSec) {
+  const out = notes.map((n) => Object.assign({}, n));
+  for (let i = 0; i < out.length - 1; i++) {
+    const gap = out[i + 1].start - (out[i].start + out[i].dur);
+    if (gap > 0 && gap <= maxGapSec) out[i].dur = out[i + 1].start - out[i].start;
+  }
+  return out;
+}
+
+// 前後のノートと±1オクターブだけずれた短い音を隣に合わせて折り返す
+// （サリエンスのオクターブ誤りで旋律が飛び跳ねるのを抑える）
+function fixOctaveOutliers(notes, opts) {
+  const o = Object.assign({ maxDur: 0.2, neighborRange: 5 }, opts);
+  const out = notes.map((n) => Object.assign({}, n));
+  for (let i = 1; i < out.length - 1; i++) {
+    const prev = out[i - 1], cur = out[i], next = out[i + 1];
+    if (cur.dur > o.maxDur) continue;
+    if (Math.abs(prev.midi - next.midi) > o.neighborRange) continue;
+    const center = (prev.midi + next.midi) / 2;
+    let best = cur.midi;
+    for (const cand of [cur.midi - 24, cur.midi - 12, cur.midi + 12, cur.midi + 24]) {
+      if (Math.abs(cand - center) < Math.abs(best - center)) best = cand;
+    }
+    if (best !== cur.midi && Math.abs(best - center) <= o.neighborRange + 2) cur.midi = best;
   }
   return out;
 }
@@ -977,7 +1096,8 @@ function* analyzePolyphonicSteps(data, rate, opts) {
     }
     fundRows.push(fundRow);
     // ドラム特徴: 正のスペクトルフラックス（増加分のみ）＋低域比＋増加分の重心
-    let flux = 0, lowFlux = 0, centWeighted = 0;
+    // ＋拡散度（増加したビンの割合。打楽器は帯域全体に広がり、音程楽器は倍音に集中する）
+    let flux = 0, lowFlux = 0, centWeighted = 0, risingBins = 0;
     if (prevMag) {
       for (let b = 1; b < mag.length; b++) {
         const d = mag[b] - prevMag[b];
@@ -987,8 +1107,19 @@ function* analyzePolyphonicSteps(data, rate, opts) {
           centWeighted += d * ((b * rate) / o.frameSize);
         }
       }
+      // 平均的な増加量の1/4を超えて増えたビンの割合（フレーム内相対なので音量非依存）
+      const riseThreshold = flux / (mag.length * 4);
+      if (flux > 0) {
+        for (let b = 1; b < mag.length; b++) {
+          if (mag[b] - prevMag[b] > riseThreshold) risingBins++;
+        }
+      }
     }
-    features.push({ flux, lowFlux, centroid: flux > 0 ? centWeighted / flux : 0 });
+    features.push({
+      flux, lowFlux,
+      centroid: flux > 0 ? centWeighted / flux : 0,
+      spread: risingBins / (o.frameSize >> 1),
+    });
     prevMag = mag;
     if (f % o.yieldEvery === 0) yield { done: f, total };
   }
@@ -1039,14 +1170,22 @@ function* analyzePolyphonicSteps(data, rate, opts) {
   const harmony = framesToNotes(harmFrames, hopTime, {
     minDur: 0.07, minClarity: 0.5, rmsGateAbs: 0.04, tuneComp: false,
   });
-  // ベース: 低域の旋律線
-  const bassPath = viterbiPitchTrack(bassRows, o.gridStep, o.lambdaPerSemi, o.jumpCap);
+  // ベース: 低域の旋律線。ベースは動きが遅いので遷移コストを重くし、最短ノートも長め
+  const bassPath = viterbiPitchTrack(bassRows, o.gridStep, o.lambdaPerSemi * 1.8, o.jumpCap);
   const bass = framesToNotes(trackToFrames(bassRows, bassPath, bassGrid), hopTime, {
-    minDur: 0.09, mergeGapSec: 0.1, tuneComp: false, midiLow: 24, midiHigh: 52,
+    minDur: 0.12, mergeGapSec: 0.12, tuneComp: false, midiLow: 24, midiHigh: 52,
   });
   // ドラム: オンセット検出 → ノイズチャンネル
   const drums = detectOnsets(features, hopTime, {});
-  return { melody, harmony, bass, drums };
+  // テンポ推定（リズム補正用。推定不能ならnull）
+  const tempo = estimateTempo(features.map((f) => f.flux), hopTime, {});
+  return {
+    melody: fixOctaveOutliers(melody, {}),
+    harmony,
+    bass: fixOctaveOutliers(bass, {}),
+    drums,
+    tempo,
+  };
 }
 
 // ---- チップシンセ（chipsynth） ----
@@ -1173,6 +1312,7 @@ const PURE = {
   fftRadix2, hannWindow, fftMagnitude, interpMag, harmonicSalience,
   midiGridRange, buildSalienceRow, viterbiPitchTrack, trackToFrames,
   detectOnsets, renderDrums, analyzePolyphonicSteps,
+  estimateTempo, quantizeNotes, quantizeDrums, legatoNotes, fixOctaveOutliers,
   renderChip, mixFloat32, renderChipTracks, buildDemoNotes, renderDemoSong,
   BUILTIN_PRESETS,
 };
@@ -1226,6 +1366,7 @@ const app = {
   notesHarmony: null,      // ハモリトラック（多声解析のみ）
   notesBass: null,         // ベーストラック（多声解析のみ）
   drumHits: null,          // ドラム打撃列（多声解析のみ）
+  tempoGrid: null,         // 推定テンポ {beat, grid, phase}（リズム補正用）
   chipBuffer: null,        // レンダリング済み AudioBuffer
   analyzing: false,
   analyzedTruncated: false,
@@ -1396,6 +1537,7 @@ function setBuffer(buffer, name) {
   app.notesHarmony = null;
   app.notesBass = null;
   app.drumHits = null;
+  app.tempoGrid = null;
   app.chipBuffer = null;
   app.wavePeaks = computePeaks(buffer, 1200);
 
@@ -1714,6 +1856,7 @@ async function analyzeCurrentBuffer() {
       app.notesHarmony = null;
       app.notesBass = null;
       app.drumHits = null;
+      app.tempoGrid = null;
     } else {
       // 曲・伴奏入り: スペクトル解析（メロディ＋ハモリ＋ベース＋ドラム）
       const ds = downsampleTo(mono, app.buffer.sampleRate, POLY_TARGET_RATE);
@@ -1730,6 +1873,7 @@ async function analyzeCurrentBuffer() {
       app.notesHarmony = result.harmony;
       app.notesBass = result.bass;
       app.drumHits = result.drums;
+      app.tempoGrid = result.tempo;
     }
     app.chipBuffer = null;
 
@@ -1743,8 +1887,9 @@ async function analyzeCurrentBuffer() {
       if (app.notesHarmony) parts.push(`ハモリ${app.notesHarmony.length}`);
       if (app.notesBass) parts.push(`ベース${app.notesBass.length}`);
       if (app.drumHits) parts.push(`ドラム${app.drumHits.length}`);
+      const bpm = app.tempoGrid ? `／テンポ約${Math.round(60 / app.tempoGrid.beat)}BPM` : "";
       $("analyze-status").textContent =
-        `${parts.join("・")} を検出` + (app.analyzedTruncated ? "（先頭120秒のみ解析）" : "");
+        `${parts.join("・")} を検出${bpm}` + (app.analyzedTruncated ? "（先頭120秒のみ解析）" : "");
       $("pianoroll").classList.remove("hidden");
       $("chip-controls").classList.remove("hidden");
       $("track-toggles").classList.toggle("hidden", app.analysisMode === "mono");
@@ -1761,25 +1906,45 @@ async function analyzeCurrentBuffer() {
   }
 }
 
+// リズム補正（テンポグリッド吸着＋レガート）を適用したノート列を返す
+function rhythmCorrected(notes) {
+  if (!notes) return notes;
+  let out = notes;
+  if ($("c-quantize").checked && app.tempoGrid) {
+    out = quantizeNotes(out, app.tempoGrid.grid, app.tempoGrid.phase);
+  }
+  if ($("c-quantize").checked) out = legatoNotes(out, 0.12);
+  return out;
+}
+
+function rhythmCorrectedDrums(hits) {
+  if (!hits) return hits;
+  if ($("c-quantize").checked && app.tempoGrid) {
+    return quantizeDrums(hits, app.tempoGrid.grid, app.tempoGrid.phase);
+  }
+  return hits;
+}
+
 // 有効トラックをまとめてレンダリング（試聴・書き出し共用）
 function renderPerformance(sampleRate) {
   const isOn = (id) => $(id).checked;
   const parts = [], gains = [];
   if (app.notes && app.notes.length && isOn("t-melody")) {
-    parts.push(renderChip(app.notes, app.chip, sampleRate));
+    parts.push(renderChip(rhythmCorrected(app.notes), app.chip, sampleRate));
     gains.push(0.8);
   }
   if (app.notesHarmony && app.notesHarmony.length && isOn("t-harmony")) {
-    parts.push(renderChip(app.notesHarmony,
+    parts.push(renderChip(rhythmCorrected(app.notesHarmony),
       { wave: "square25", vibrato: app.chip.vibrato * 0.5, decay: app.chip.decay }, sampleRate));
     gains.push(0.45);
   }
   if (app.notesBass && app.notesBass.length && isOn("t-bass")) {
-    parts.push(renderChip(app.notesBass, { wave: "triangle", vibrato: 0, decay: 0.15 }, sampleRate));
+    parts.push(renderChip(rhythmCorrected(app.notesBass),
+      { wave: "triangle", vibrato: 0, decay: 0.15 }, sampleRate));
     gains.push(0.6);
   }
   if (app.drumHits && app.drumHits.length && isOn("t-drums")) {
-    parts.push(renderDrums(app.drumHits, sampleRate));
+    parts.push(renderDrums(rhythmCorrectedDrums(app.drumHits), sampleRate));
     gains.push(0.7);
   }
   if (parts.length === 0) return null;
@@ -1793,9 +1958,12 @@ function drawPianoroll() {
   if (!hasAnyChipTrack()) return;
 
   const DRUM_LANE = 12; // 下端のドラム表示帯（px・キャンバス座標）
+  const trackNotes = {};
+  for (const def of TRACK_DEFS) trackNotes[def.key] = rhythmCorrected(app[def.key]);
+  const drumHits = rhythmCorrectedDrums(app.drumHits);
   let minMidi = 127, maxMidi = 0, maxT = 0.1;
   for (const def of TRACK_DEFS) {
-    const notes = app[def.key];
+    const notes = trackNotes[def.key];
     if (!notes) continue;
     for (const n of notes) {
       if (n.midi < minMidi) minMidi = n.midi;
@@ -1803,10 +1971,10 @@ function drawPianoroll() {
       if (n.start + n.dur > maxT) maxT = n.start + n.dur;
     }
   }
-  if (app.drumHits) for (const h of app.drumHits) if (h.t > maxT) maxT = h.t;
+  if (drumHits) for (const h of drumHits) if (h.t > maxT) maxT = h.t;
   if (minMidi > maxMidi) { minMidi = 60; maxMidi = 72; }
   minMidi -= 2; maxMidi += 2;
-  const laneH = app.drumHits && app.drumHits.length ? DRUM_LANE : 0;
+  const laneH = drumHits && drumHits.length ? DRUM_LANE : 0;
   const rows = maxMidi - minMidi + 1;
   const rowH = (c.height - laneH) / rows;
   const noteY = (midi) => c.height - laneH - (midi - minMidi + 1) * rowH;
@@ -1817,7 +1985,7 @@ function drawPianoroll() {
     if (m % 12 === 0) g.fillRect(0, noteY(m), c.width, 1);
   }
   for (const def of TRACK_DEFS) {
-    const notes = app[def.key];
+    const notes = trackNotes[def.key];
     if (!notes || !$(def.toggleId).checked) continue;
     g.fillStyle = def.color;
     for (const n of notes) {
@@ -1827,9 +1995,9 @@ function drawPianoroll() {
       g.fillRect(x, noteY(n.midi), w, Math.max(2, rowH - 1));
     }
   }
-  if (app.drumHits && $("t-drums").checked) {
+  if (drumHits && $("t-drums").checked) {
     g.fillStyle = "#8791b3";
-    for (const h of app.drumHits) {
+    for (const h of drumHits) {
       const x = (h.t / maxT) * c.width;
       g.globalAlpha = 0.4 + 0.6 * h.strength;
       g.fillRect(x, c.height - laneH + 2, 2, laneH - 4);
@@ -2070,10 +2238,10 @@ function bindEvents() {
     app.analysisMode = $("b-mode").value;
     saveSettingsDebounced();
   });
-  for (const id of ["t-melody", "t-harmony", "t-bass", "t-drums"]) {
+  for (const id of ["t-melody", "t-harmony", "t-bass", "t-drums", "c-quantize"]) {
     $(id).addEventListener("change", () => {
       stopChipPlayback();
-      app.chipBuffer = null; // トラック構成が変わったので再レンダリング
+      app.chipBuffer = null; // トラック構成/リズム補正が変わったので再レンダリング
       drawPianoroll();
     });
   }

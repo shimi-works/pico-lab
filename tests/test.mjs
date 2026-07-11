@@ -429,6 +429,87 @@ test("統合: 本物のハモリは検出され、メロディだけの音源で
     `ハモリ検出 2/3 以上（実際: ${harmMidis.join(",")}）`);
 });
 
+// ---- リズム後処理 ----
+
+test("estimateTempo: 周期的なフラックスからビートを推定", () => {
+  // 0.5秒（120BPM）ごとにスパイクのある10秒分のフラックス列
+  const hop = 0.01;
+  const flux = new Array(1000).fill(0.05);
+  for (let i = 0; i < 1000; i += 50) flux[i] = 2.0;
+  const tempo = P.estimateTempo(flux, hop, {});
+  assert.ok(tempo, "推定できること");
+  approx(tempo.beat, 0.5, 0.03, "ビート周期");
+  approx(tempo.grid, 0.125, 0.01, "16分グリッド");
+  assert.ok(Math.abs(tempo.phase % 0.5) < 0.03 || Math.abs((tempo.phase % 0.5) - 0.5) < 0.03,
+    `位相がスパイクに合う (phase=${tempo.phase})`);
+});
+
+test("estimateTempo: 短すぎる/無音の素材では null", () => {
+  assert.equal(P.estimateTempo(new Array(100).fill(0.1), 0.01, {}), null, "3秒未満");
+});
+
+test("quantizeNotes: グリッドに吸着し、重なりは前を詰める", () => {
+  const notes = [
+    { start: 0.48, dur: 0.4, midi: 60, vel: 1 },
+    { start: 1.02, dur: 0.25, midi: 62, vel: 1 },
+  ];
+  const q = P.quantizeNotes(notes, 0.125, 0);
+  approx(q[0].start, 0.5, 1e-9, "開始が吸着");
+  approx(q[0].dur, 0.375, 1e-9, "終了 0.88→0.875 に吸着");
+  approx(q[1].start, 1.0, 1e-9, "2音目の開始");
+});
+
+test("legatoNotes: 小さなすき間を埋める（大きなすき間は残す）", () => {
+  const notes = [
+    { start: 0, dur: 0.4, midi: 60, vel: 1 },
+    { start: 0.48, dur: 0.3, midi: 62, vel: 1 },  // 80msのすき間 → 埋まる
+    { start: 1.5, dur: 0.3, midi: 64, vel: 1 },   // 720msのすき間 → 残る
+  ];
+  const out = P.legatoNotes(notes, 0.12);
+  approx(out[0].dur, 0.48, 1e-9, "すき間が埋まる");
+  approx(out[1].dur, 0.3, 1e-9, "大きなすき間は伸ばさない");
+});
+
+test("fixOctaveOutliers: 短いオクターブ外れを隣に合わせる", () => {
+  const notes = [
+    { start: 0, dur: 0.3, midi: 67, vel: 1 },
+    { start: 0.3, dur: 0.1, midi: 81, vel: 1 },  // 69の+12（短い）→ 69へ折り返し
+    { start: 0.4, dur: 0.3, midi: 69, vel: 1 },
+  ];
+  const out = P.fixOctaveOutliers(notes, {});
+  assert.equal(out[1].midi, 69);
+  // 長いノートは補正しない
+  const keep = P.fixOctaveOutliers([
+    { start: 0, dur: 0.3, midi: 67, vel: 1 },
+    { start: 0.3, dur: 0.5, midi: 81, vel: 1 },
+    { start: 0.8, dur: 0.3, midi: 69, vel: 1 },
+  ], {});
+  assert.equal(keep[1].midi, 81);
+});
+
+test("quantizeDrums: 吸着と同一スロット重複の除去", () => {
+  const hits = [
+    { t: 0.49, type: "kick", strength: 0.9 },
+    { t: 0.51, type: "kick", strength: 0.5 }, // 同じスロットに吸着 → 強い方だけ残る
+    { t: 0.74, type: "hat", strength: 0.6 },
+  ];
+  const q = P.quantizeDrums(hits, 0.25, 0);
+  assert.equal(q.length, 2, JSON.stringify(q));
+  approx(q[0].t, 0.5, 1e-9, "キック位置");
+  approx(q[0].strength, 0.9, 1e-9, "強い方が残る");
+  approx(q[1].t, 0.75, 1e-9, "ハット位置");
+});
+
+test("detectOnsets: 帯域拡散が低い立ち上がり（音程楽器のアタック）は除外", () => {
+  const features = [];
+  for (let i = 0; i < 120; i++) features.push({ flux: 0.1, lowFlux: 0.01, centroid: 2000, spread: 0.1 });
+  features[30] = { flux: 0.5, lowFlux: 0.05, centroid: 3000, spread: 0.05 }; // 集中型 → 除外
+  features[60] = { flux: 0.5, lowFlux: 0.05, centroid: 3000, spread: 0.6 };  // 拡散型 → 検出
+  const hits = P.detectOnsets(features, 0.01, {});
+  assert.equal(hits.length, 1, JSON.stringify(hits));
+  approx(hits[0].t, 0.6, 1e-9, "拡散型のみ検出");
+});
+
 // ---- チップシンセ ----
 
 test("renderChip: 長さ・振幅・無音区間が正しい", () => {
