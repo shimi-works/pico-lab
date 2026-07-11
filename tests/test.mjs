@@ -220,6 +220,64 @@ test("framesToNotes: clarity低・音量ゲート未満は無視", () => {
   assert.equal(notes.length, 0);
 });
 
+test("circularMeanFraction: 一定のチューニングずれを推定", () => {
+  approx(P.circularMeanFraction([5.2, 7.2, 9.2]), 0.2, 1e-6, "+0.2");
+  approx(P.circularMeanFraction([60.9, 64.9]), -0.1, 1e-6, "-0.1");
+  approx(P.circularMeanFraction([60, 62, 64]), 0, 1e-6, "ずれなし");
+});
+
+test("framesToNotes: ビブラートのかかった1音が割れない", () => {
+  // 69±0.45半音で揺れる60フレーム（実録音の歌声を模擬）
+  const frames = [];
+  for (let i = 0; i < 60; i++) {
+    const m = 69 + 0.45 * Math.sin(i * 0.7);
+    frames.push({ freq: P.midiToFreq(m), clarity: 0.85, rms: 0.1 });
+  }
+  const notes = P.framesToNotes(frames, 0.01, {});
+  assert.equal(notes.length, 1, `ノート数: ${JSON.stringify(notes)}`);
+  assert.equal(notes[0].midi, 69);
+});
+
+test("framesToNotes: 全体のデチューンがあっても音程間隔が保たれる", () => {
+  // 半音の中間（x.47〜x.53）で歌われたメロディ。補正なしだと丸めがばたつく
+  const frames = [];
+  const push = (midiFloat, n) => {
+    for (let i = 0; i < n; i++) frames.push({ freq: P.midiToFreq(midiFloat), clarity: 0.9, rms: 0.1 });
+  };
+  push(69.47, 20);
+  for (let i = 0; i < 6; i++) frames.push(null);
+  push(71.53, 20);
+  for (let i = 0; i < 6; i++) frames.push(null);
+  push(74.5, 20);
+  const notes = P.framesToNotes(frames, 0.01, {});
+  assert.equal(notes.length, 3, `ノート数: ${JSON.stringify(notes)}`);
+  assert.equal(notes[1].midi - notes[0].midi, 2, "第1音程（全音）");
+  assert.equal(notes[2].midi - notes[1].midi, 3, "第2音程（短3度）");
+});
+
+test("framesToNotes: 短い途切れの同音ノートは結合される", () => {
+  const frames = [];
+  for (let i = 0; i < 15; i++) frames.push({ freq: 440, clarity: 0.9, rms: 0.1 });
+  for (let i = 0; i < 5; i++) frames.push(null); // 50msの息継ぎ
+  for (let i = 0; i < 10; i++) frames.push({ freq: 440, clarity: 0.9, rms: 0.1 });
+  const notes = P.framesToNotes(frames, 0.01, {});
+  assert.equal(notes.length, 1, `ノート数: ${JSON.stringify(notes)}`);
+  approx(notes[0].dur, 0.3, 1e-9, "結合後の長さ");
+});
+
+test("framesToNotes: 同音連打は音量の再アタックで分割される", () => {
+  const frames = [];
+  const rmsSeq = [];
+  for (let i = 0; i < 12; i++) rmsSeq.push(0.1);
+  rmsSeq.push(0.03, 0.02); // 音量が落ち込み…
+  for (let i = 0; i < 16; i++) rmsSeq.push(0.1); // …急回復（タンギング）
+  for (const r of rmsSeq) frames.push({ freq: 440, clarity: 0.9, rms: r });
+  const notes = P.framesToNotes(frames, 0.01, {});
+  assert.equal(notes.length, 2, `ノート数: ${JSON.stringify(notes)}`);
+  assert.equal(notes[0].midi, 69);
+  assert.equal(notes[1].midi, 69);
+});
+
 // ---- チップシンセ ----
 
 test("renderChip: 長さ・振幅・無音区間が正しい", () => {
@@ -308,6 +366,50 @@ test("統合: チップ音を採譜すると元のノートに戻る", () => {
   const midis = notes.map((n) => n.midi);
   for (const m of [69, 72, 76]) {
     assert.ok(midis.includes(m), `midi ${m} が検出される（実際: ${midis.join(",")}）`);
+  }
+});
+
+test("統合: 声を模した音（倍音+ビブラート+デチューン+ノイズ）から元メロディを復元", () => {
+  const sr = 11025;
+  const melody = [67, 69, 71, 69, 67];
+  const NOTE_DUR = 0.35, GAP = 0.06, DETUNE = 0.3;
+  let seed = 424242;
+  const rand = () => (seed = (seed * 48271) % 2147483647) / 2147483647;
+
+  const total = melody.length * (NOTE_DUR + GAP);
+  const audio = new Float32Array(Math.ceil(total * sr));
+  melody.forEach((midi, k) => {
+    const startIdx = Math.floor(k * (NOTE_DUR + GAP) * sr);
+    const n = Math.floor(NOTE_DUR * sr);
+    let phase = 0;
+    for (let i = 0; i < n; i++) {
+      const t = i / sr;
+      const vib = 0.3 * Math.min(1, t / 0.15) * Math.sin(2 * Math.PI * 5.5 * t);
+      const freq = P.midiToFreq(midi + DETUNE + vib);
+      phase += freq / sr;
+      const p = 2 * Math.PI * phase;
+      // 倍音を持つ声っぽい波形
+      let s = Math.sin(p) + 0.5 * Math.sin(2 * p) + 0.25 * Math.sin(3 * p);
+      let env = 1;
+      if (t < 0.02) env = t / 0.02;
+      if (NOTE_DUR - t < 0.03) env = (NOTE_DUR - t) / 0.03;
+      audio[startIdx + i] = s * 0.25 * env + (rand() * 2 - 1) * 0.015;
+    }
+  });
+
+  const hop = Math.round(sr * 0.01);
+  const frames = [];
+  for (let i = 0; i + 1024 <= audio.length; i += hop) {
+    const frame = audio.subarray(i, i + 1024);
+    const p = P.yinPitch(frame, sr, 70, 1200);
+    frames.push(p ? { freq: p.freq, clarity: p.clarity, rms: P.frameRms(frame) } : null);
+  }
+  const notes = P.framesToNotes(frames, hop / sr, {});
+  const midis = notes.map((n) => n.midi);
+  assert.equal(midis.length, melody.length, `検出ノート: ${JSON.stringify(notes)}`);
+  // デチューン補正は半音グリッドの取り方に±1の自由度があるため、音程の並びで検証する
+  for (let i = 1; i < melody.length; i++) {
+    assert.equal(midis[i] - midis[0], melody[i] - melody[0], `音程 ${i}`);
   }
 });
 

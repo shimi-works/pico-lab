@@ -245,12 +245,12 @@ footer a { color: var(--dim); }
     </div>
 
     <div class="tabs" role="tablist">
-      <button id="tab-a" class="active" role="tab" aria-selected="true">モードA: 8bitエフェクト</button>
-      <button id="tab-b" role="tab" aria-selected="false">モードB: ピコピコ再合成（実験室）</button>
+      <button id="tab-b" class="active" role="tab" aria-selected="true">ピコピコ再合成（ファミコン化）</button>
+      <button id="tab-a" role="tab" aria-selected="false">8bitエフェクト</button>
     </div>
 
     <!-- モードA -->
-    <div class="tab-body" id="panel-a">
+    <div class="tab-body hidden" id="panel-a">
       <div class="presets" id="preset-bar"></div>
       <div class="param-row">
         <label for="p-bits">ビット深度</label>
@@ -279,10 +279,10 @@ footer a { color: var(--dim); }
     </div>
 
     <!-- モードB -->
-    <div class="tab-body hidden" id="panel-b">
+    <div class="tab-body" id="panel-b">
       <p class="note">
-        歌・口笛・単音楽器の録音からメロディを検出し、チップシンセで鳴らし直す実験機能です。
-        <strong>単音の音源限定</strong>（ミックス済みの市販曲では正しく検出できません）。解析は先頭120秒まで。
+        歌・口笛・単音楽器の録音からメロディを検出し、ファミコンのチップ音源で鳴らし直します。
+        <strong>単音の音源向け</strong>（ミックス済みの市販曲では正しく検出できません）。解析は先頭120秒まで。
       </p>
       <div class="row-actions">
         <button id="btn-analyze" class="primary">この音源を解析する</button>
@@ -294,9 +294,9 @@ footer a { color: var(--dim); }
         <div class="param-row">
           <label for="c-wave">波形</label>
           <select id="c-wave">
-            <option value="square50">矩形波 50%（ファミコン風）</option>
-            <option value="square25">矩形波 25%（細めの音）</option>
-            <option value="triangle">三角波（やわらかい）</option>
+            <option value="square50">ファミコン矩形波 50%（メロディの定番）</option>
+            <option value="square25">ファミコン矩形波 25%（細め・軽快）</option>
+            <option value="triangle">ファミコン三角波（ベース・やわらかめ）</option>
           </select>
           <span></span>
         </div>
@@ -509,7 +509,17 @@ function yinPitch(frame, sampleRate, fmin, fmax) {
       break;
     }
   }
-  if (tau < 0) return null;
+  if (tau < 0) {
+    // 閾値を割る谷がなくても、十分深い全体最小値なら採用する。
+    // 息混じりの歌声・鼻歌はCMNDが0.15を割らないことが多く、
+    // 捨てるとノートが歯抜けになる（最終判断は framesToNotes 側のclarityゲート）
+    const FALLBACK_LIMIT = 0.5;
+    let bestVal = FALLBACK_LIMIT;
+    for (let t = tauMin; t <= tauMax; t++) {
+      if (cmnd[t] < bestVal) { bestVal = cmnd[t]; tau = t; }
+    }
+    if (tau < 0) return null;
+  }
 
   // 放物線補間でサブサンプル精度に
   let betterTau = tau;
@@ -547,47 +557,116 @@ function medianFilterNullable(arr, windowSize) {
   return out;
 }
 
+function medianOf(values) {
+  const s = [...values].sort((a, b) => a - b);
+  return s[s.length >> 1];
+}
+
+// midi値列の平均チューニングずれ（半音の端数）を円周統計で推定する。
+// 鼻歌・口笛はA440に合っていないことが多く、これを引いてから丸めないと
+// x.5付近の音が半音単位でばたつく（円周平均なので±0.5の境界も安全）
+function circularMeanFraction(values) {
+  let sinSum = 0, cosSum = 0;
+  for (const v of values) {
+    const a = 2 * Math.PI * (v - Math.round(v));
+    sinSum += Math.sin(a);
+    cosSum += Math.cos(a);
+  }
+  if (sinSum === 0 && cosSum === 0) return 0;
+  return Math.atan2(sinSum, cosSum) / (2 * Math.PI);
+}
+
 // フレーム列 [{freq, clarity, rms} | null] → ノート列 [{start, dur, midi, vel}]
+// 方針: 半音に丸める前の連続ピッチでセグメント化し、セグメント中央値を丸める。
+// ビブラート・しゃくり等の揺れで1音が複数ノートに割れるのを防ぐ
 function framesToNotes(frames, hopTime, opts) {
-  const o = Object.assign({ minDur: 0.06, minClarity: 0.5, midiLow: 24, midiHigh: 96 }, opts);
+  const o = Object.assign({
+    minDur: 0.06,        // これ未満のノートは破棄
+    minClarity: 0.5,     // YIN信頼度ゲート
+    midiLow: 24, midiHigh: 96,
+    splitSemi: 0.7,      // 隣接フレームのピッチ跳躍がこれを超えたら別ノート
+    maxGapFrames: 3,     // 無声フレームがこの数まで続いても同一ノート扱い
+    mergeGapSec: 0.08,   // 同音ノートの間隙がこれ以下なら結合（音量の揺れ対策）
+    reattackDip: 0.35,   // 音量がピークのこの割合を下回った後…
+    reattackRise: 2.2,   // …この倍率で急回復したら同音連打として分割
+  }, opts);
+
+  // 音量統計 → 有声ゲート
   let maxRms = 0;
   for (const f of frames) if (f && f.rms > maxRms) maxRms = f.rms;
   const rmsGate = Math.max(0.005, maxRms * 0.08);
 
+  // 有声フレーム → 連続midi値（丸めない）
   const midis = frames.map((f) => {
     if (!f || !f.freq || f.clarity < o.minClarity || f.rms < rmsGate) return null;
-    const m = Math.round(freqToMidi(f.freq));
-    return (m >= o.midiLow && m <= o.midiHigh) ? m : null;
+    const m = freqToMidi(f.freq);
+    return (m >= o.midiLow - 0.5 && m <= o.midiHigh + 0.5) ? m : null;
   });
   const smoothed = medianFilterNullable(midis, 5);
 
-  const notes = [];
-  let cur = null; // {midi, startIdx, count, rmsSum}
-  const flush = (endIdx) => {
-    if (!cur) return;
-    const dur = cur.count * hopTime;
-    if (dur >= o.minDur) {
-      notes.push({
-        start: cur.startIdx * hopTime,
-        dur,
-        midi: cur.midi,
-        rmsMean: cur.rmsSum / cur.count,
-      });
-    }
-    cur = null;
-  };
+  const voiced = smoothed.filter((v) => v !== null);
+  if (voiced.length === 0) return [];
+  const tuningOffset = circularMeanFraction(voiced);
+
+  // 有声ラン抽出（maxGapFrames以下の無声ギャップは同一ランとして継続）
+  const runs = [];
+  let run = null, gap = 0;
   for (let i = 0; i < smoothed.length; i++) {
-    const m = smoothed[i];
-    const rms = frames[i] ? frames[i].rms : 0;
-    if (m === null) { flush(i); continue; }
-    if (cur && cur.midi === m) {
-      cur.count++; cur.rmsSum += rms;
+    if (smoothed[i] === null) {
+      gap++;
+      if (run && gap > o.maxGapFrames) { runs.push(run); run = null; }
+      continue;
+    }
+    gap = 0;
+    if (!run) run = [];
+    run.push({ idx: i, m: smoothed[i], rms: frames[i] ? frames[i].rms : 0 });
+  }
+  if (run) runs.push(run);
+
+  // ラン内をピッチ跳躍・再アタックで分割
+  const segments = [];
+  for (const r of runs) {
+    let seg = [], peak = 0, prev = null;
+    for (const item of r) {
+      const jump = prev && Math.abs(item.m - prev.m) > o.splitSemi;
+      const reattack = prev && prev.rms < peak * o.reattackDip &&
+        item.rms > prev.rms * o.reattackRise;
+      if (seg.length > 0 && (jump || reattack)) {
+        segments.push(seg);
+        seg = []; peak = 0;
+      }
+      seg.push(item);
+      if (item.rms > peak) peak = item.rms;
+      prev = item;
+    }
+    if (seg.length > 0) segments.push(seg);
+  }
+
+  // セグメント → ノート（中央値ピッチをチューニング補正してから半音へ丸める）
+  const rawNotes = [];
+  for (const seg of segments) {
+    const start = seg[0].idx * hopTime;
+    const dur = (seg[seg.length - 1].idx + 1) * hopTime - start;
+    if (dur < o.minDur) continue;
+    const midi = Math.round(medianOf(seg.map((s) => s.m)) - tuningOffset);
+    if (midi < o.midiLow || midi > o.midiHigh) continue;
+    let rmsSum = 0;
+    for (const s of seg) rmsSum += s.rms;
+    rawNotes.push({ start, dur, midi, rmsMean: rmsSum / seg.length });
+  }
+
+  // 同音で間隙の小さいノートを結合（間隙0=意図的な分割は結合しない）
+  const notes = [];
+  for (const n of rawNotes) {
+    const last = notes[notes.length - 1];
+    const gapSec = last ? n.start - (last.start + last.dur) : Infinity;
+    if (last && last.midi === n.midi && gapSec > hopTime * 0.5 && gapSec <= o.mergeGapSec) {
+      last.dur = n.start + n.dur - last.start;
+      last.rmsMean = Math.max(last.rmsMean, n.rmsMean);
     } else {
-      flush(i);
-      cur = { midi: m, startIdx: i, count: 1, rmsSum: rms };
+      notes.push(Object.assign({}, n));
     }
   }
-  flush(smoothed.length);
 
   // 音量 → ベロシティ（最大値基準で 0.3〜1.0）
   let maxMean = 0;
@@ -696,7 +775,8 @@ const BUILTIN_PRESETS = [
 const PURE = {
   crushQuantize, createCrushState, processCrush, encodeWavPcm16,
   mixToMono, downsampleTo, frameRms, yinPitch, freqToMidi, midiToFreq,
-  medianFilterNullable, framesToNotes, renderChip, buildDemoNotes, renderDemoSong,
+  medianFilterNullable, medianOf, circularMeanFraction, framesToNotes,
+  renderChip, buildDemoNotes, renderDemoSong,
   BUILTIN_PRESETS,
 };
 if (typeof module !== "undefined" && module.exports) module.exports = PURE;
@@ -1521,7 +1601,7 @@ function bindEvents() {
 
 /* ===== 起動 ===== */
 
-app.activeTab = "a";
+app.activeTab = "b"; // ピコピコ再合成がメイン機能
 loadSettings();
 renderPresetBar();
 applyParamsToControls();
